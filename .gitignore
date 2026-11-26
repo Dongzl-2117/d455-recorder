@@ -1,0 +1,17 @@
+# Local environment created by run.sh / run.bat
+.venv/
+__pycache__/
+*.pyc
+
+# Recorder output: recordings and diagnose reports stay on the recording machine
+sessions/
+logs/
+*.mcap
+*.bag
+
+# Packaged copy of this folder
+*.zip
+
+# OS clutter
+.DS_Store
+Thumbs.db

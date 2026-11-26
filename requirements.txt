@@ -1,0 +1,8 @@
+# RealSense SDK Python wrapper. RealSense publishes wheels for Windows and Linux only;
+# on macOS the community build of the same SDK is used (it also imports as pyrealsense2).
+pyrealsense2>=2.54 ; sys_platform != "darwin"
+pyrealsense2-macosx>=2.54 ; sys_platform == "darwin"
+numpy
+opencv-python
+mcap>=1.0
+protobuf>=3.20
