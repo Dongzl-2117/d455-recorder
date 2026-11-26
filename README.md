@@ -49,8 +49,8 @@ bash install_service.sh      # 输一次开机密码，约 2 分钟，装完自�
 | 与现有标注工具兼容 | 已用 `thermal-tof-ZhilinHome` 里的 `session_reader.py` 打开模拟 session，彩色、深度、红外通道和 meta 时间线都能读到 |
 | Ctrl+C、强杀进程后恢复、相机断流、启动失败重试、磁盘写不过来 | 已用模拟相机逐项测试 |
 | Mac 上安装 | 2026-11-26 在 macOS 27.2.1 + Apple 芯片上装好，`pyrealsense2-macosx` 2.56.5 |
-| 真实 D455 接在 Mac 上录制 | **还没有录成**。USB 3 线、IMU 防护、USB 占用都已在 Mac 上验证，`diagnose` 三路都出帧；录制在三路开起来之后卡死，原因已查明（见下表"录制卡在相机信息那几行"），1.2.8 已绕开，待在 Mac 上验证 |
-| 网页界面 D455 Studio | 用模拟相机跑通实时预览、录制、调参、回放、强杀后修复；真实相机和 Mac 后台服务待在 Mac 上验证 |
+| 真实 D455 接在 Mac 上录制 | **已录成**（2026-11-26，1.2.8，60 秒）：体检 PASS；深度、彩色、红外都是 29.97 fps，相机端和脚本端丢帧 0；彩色和深度的时间戳差中位数 0.008 ms、最大 1.1 ms，红外和深度为同一时刻 |
+| 网页界面 D455 Studio | 用模拟相机跑通实时预览、录制、调参、回放、强杀后修复；Mac 后台服务已装好（2026-11-26），真相机测试进行中 |
 
 Mac 是 RealSense 官方支持最弱的平台。官方安装文档原话是 "macOS support for the full range of functionality offered by the SDK is not yet complete"。2026-11-26 在 Mac 上实际遇到的问题和脚本的对应处理：
 
@@ -108,7 +108,7 @@ Mac 是 RealSense 官方支持最弱的平台。官方安装文档原话是 "mac
 | Windows / Linux | 官方 `pyrealsense2`，pip 会按 Python 版本自动选对应的 SDK 版本 |
 | Python | 3.9 或更新 |
 | 线和口 | USB 3 口 + USB 3 数据线（标 5Gbps、10Gbps 或雷电）。默认三路流的原始数据约 735 Mb/s（深度 195、彩色 442、红外 98），USB 2 标称 480 Mb/s，实际可用约 300 Mb/s，装不下。很多 USB-C 对 USB-C 的充电线只有 USB 2 线芯 |
-| 磁盘 | 默认设置估算约 30 到 110 GB/小时（8 到 30 MB/s），取决于画面内容，这个数还没有用真实相机测过。录制时状态行实时显示 MB/s。剩 70 GB 的磁盘按最坏情况约能录 40 分钟，长时间录制建议录到外接 SSD（`--out /Volumes/<盘名>/sessions`） |
+| 磁盘 | 实测（室内、默认设置）约 15 MB/s，即每小时约 54 GB：深度 PNG 5.8、彩色 JPEG 6.0、红外 JPEG 3.3 MB/s。画面细节多时会更大。录制时状态行实时显示 MB/s。剩 70 GB 的磁盘约能录 1 小时出头，长时间录制建议录到外接 SSD（`--out /Volumes/<盘名>/sessions`）；不需要红外时去掉它能省约 22% |
 
 官方没有 macOS 的 pip 包，Mac 上用的是社区编译的同一份 SDK（[cansik/pyrealsense2-macosx](https://github.com/cansik/pyrealsense2-macosx)），导入名仍是 `pyrealsense2`。`run.sh` 会自动选对的包。
 
@@ -176,7 +176,7 @@ MCAP 里的 topic（`<dev>` 形如 `d455_<序列号>`）：
 
 | 字段 | 含义 | 用途 |
 |---|---|---|
-| `timestamp_ms` / MCAP `log_time` | 硬件时钟换算成的 epoch 时间（读出开始时刻） | 默认用这个。以后与热成像、ToF 同时录时，用它跨设备对齐 |
+| `timestamp_ms` / MCAP `log_time` | 硬件时钟换算成的 epoch 时间（读出开始时刻），由 SDK 换算 | 三路之间对齐默认用这个。注意它对电脑时钟的绝对值不稳：Mac 实测开流后头约 4 秒偏差可达 100 ms，之后仍会慢慢移动几毫秒。要跨设备对绝对时间时，用体检报告 `device_clock.host_clock_line` 从 `hw_timestamp_us` 换算（实测残差 p99 0.2 ms） |
 | `hw_timestamp_us` | 相机硬件时钟原始值，微秒 | 三路之间最精确的相对时间。32 位计数器，约 71.6 分钟回绕一次，分析代码已处理 |
 | `sensor_timestamp_us` | 曝光中点的硬件时钟值 | 需要知道画面真正的拍摄时刻时用 |
 | `host_receive_epoch_ns` / MCAP `publish_time` | 电脑收到这帧的系统时间 | 排查延迟和时钟问题 |

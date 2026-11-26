@@ -75,7 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__version__ = "1.2.8"
+__version__ = "1.2.9"
 FORMAT_NAME = "realsense-mcap-session"
 FORMAT_VERSION = 1
 HW_CLOCK_WRAP_US = 1 << 32  # the D400 device clock is a 32-bit microsecond counter (~71.6 min)
@@ -457,6 +457,7 @@ class McapSink:
 # --------------------------------------------------------------------------------------------
 START_CHECK_S = 5.0    # every video stream must deliver a first frame this soon after starting
 START_CHECK_TRIES = 3  # starts in one attempt before the recorder gives up and retries from scratch
+CLOCK_WARMUP_MS = 5000.0  # the SDK's global_time settles within the first ~4 s of a stream (seen on the Mac)
 START_HANG_S = 40.0    # a start that takes longer is stuck inside the SDK: dump stacks, explain
 START_GIVE_UP_S = 150.0  # then exit, because Ctrl+C cannot reach a thread blocked inside the SDK
 MACOS_SAMPLE_TOOL = "/usr/bin/sample"  # built into macOS: native stacks of a running process
@@ -2108,7 +2109,10 @@ def analyze_session(session_dir: Path, nominal: Optional[Dict[str, float]] = Non
                           ("{:.4f}".format(value) if isinstance(value, (float, np.floating)) else int(value)))
                          for value in line])
 
-    # Device clock vs epoch: how stable is the SDK's hardware-to-epoch mapping.
+    # Device clock vs epoch. Seen on the Mac: the SDK's global_time (the epoch timestamps) is up to ~100 ms off
+    # during the first ~4 s of a stream and then moves by a few ms while it keeps adjusting, whereas the camera
+    # clock against the host clock is a straight line (residual p99 0.2 ms). So both are fitted after a warm-up,
+    # and the host-clock line is reported so that absolute times can be rebuilt from hw_timestamp_us.
     clock: Dict[str, Any] = {}
     if anchor and np.any(index[anchor]["hw_us"] >= 0):
         entry = index[anchor]
@@ -2117,12 +2121,41 @@ def analyze_session(session_dir: Path, nominal: Optional[Dict[str, float]] = Non
         if len(hardware) >= 10:
             wraps = np.concatenate(([0], np.cumsum(np.diff(hardware) < -HW_CLOCK_WRAP_US / 2)))
             unwrapped = hardware + wraps * HW_CLOCK_WRAP_US
+            x = (unwrapped - unwrapped[0]) / 1000.0  # ms on the device clock since the first anchor frame
             epoch = entry["log_time_ns"][valid] / 1e6
-            x = (unwrapped - unwrapped[0]) / 1000.0
-            slope, intercept = np.polyfit(x, epoch - epoch[0], 1)
-            residual = (epoch - epoch[0]) - (slope * x + intercept)
-            clock = {"hw_clock_wraps": int(wraps[-1]), "drift_ppm": round((float(slope) - 1.0) * 1e6, 3),
-                     "residual_ms": _percentiles(np.abs(residual))}
+            host = entry["receive_ns"][valid] / 1e6
+            settled = x >= CLOCK_WARMUP_MS
+            if int(settled.sum()) < 10:
+                settled = np.ones(len(x), dtype=bool)
+
+            def fit(values: Any) -> Tuple[float, float, Any]:
+                relative = values - values[0]
+                slope, intercept = np.polyfit(x[settled], relative[settled], 1)
+                return float(slope), float(intercept), relative - (slope * x + intercept)
+
+            host_slope, host_intercept, host_residual = fit(host)
+            global_slope, _, global_residual = fit(epoch)
+            stray = epoch - (host[0] + host_intercept + host_slope * x)  # global_time minus the host-clock line
+            stray = stray - float(np.median(stray[settled]))
+            early = ~settled
+            clock = {
+                "hw_clock_wraps": int(wraps[-1]),
+                "warmup_excluded_s": round(CLOCK_WARMUP_MS / 1000.0, 1) if early.any() else 0.0,
+                "drift_ppm": round((host_slope - 1.0) * 1e6, 3),  # camera clock vs host clock
+                "residual_ms": _percentiles(np.abs(host_residual[settled])),
+                "global_time_drift_ppm": round((global_slope - 1.0) * 1e6, 3),
+                "global_time_residual_ms": _percentiles(np.abs(global_residual[settled])),
+                "global_time_offset_ms": {
+                    "warmup_max_abs": round(float(np.max(np.abs(stray[early]))), 3) if early.any() else 0.0,
+                    "after_warmup_max_abs": round(float(np.max(np.abs(stray[settled]))), 3)},
+                "host_clock_line": {
+                    "stream": anchor, "first_hw_timestamp_us": int(hardware[0]),
+                    "epoch_ms_at_first_frame": round(float(host[0] + host_intercept), 3),
+                    "epoch_ms_per_device_ms": round(host_slope, 12),
+                    "use": "epoch_ms = epoch_ms_at_first_frame + epoch_ms_per_device_ms * (unwrapped "
+                           "hw_timestamp_us - first_hw_timestamp_us) / 1000; includes this stream's transfer "
+                           "latency to the host (a few ms)"},
+            }
     imu_summary: Dict[str, Any] = {}
     for name in MOTION_STREAMS:
         entry = capture.get(name)
@@ -2184,6 +2217,10 @@ def print_report(report: Dict[str, Any]) -> None:
     if clock:
         log("  device clock: drift {} ppm vs host, fit residual p95 {} ms, wraps {}".format(
             clock.get("drift_ppm"), clock.get("residual_ms", {}).get("p95"), clock.get("hw_clock_wraps")))
+        offset = clock.get("global_time_offset_ms") or {}
+        if offset and clock.get("warmup_excluded_s"):
+            log("  SDK epoch timestamps vs host clock: up to {} ms off in the first {} s, {} ms after".format(
+                offset.get("warmup_max_abs"), clock.get("warmup_excluded_s"), offset.get("after_warmup_max_abs")))
     for line in report.get("problems", []):
         log("  PROBLEM: " + line)
     for line in report.get("warnings", []):
