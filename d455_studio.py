@@ -396,6 +396,7 @@ class LiveCamera:
                  log_dir: Optional[Path] = None, idle_after: float = IDLE_AFTER_S) -> None:
         self.rs = rs
         self.idle_after = idle_after if idle_after > 0 else float("inf")
+        self.service = False  # started by launchd (install_service.sh): the page may restart the process
         self.log_dir = log_dir or HERE / "logs"
         self.settings = settings
         self.out_root = out_root
@@ -403,6 +404,7 @@ class LiveCamera:
         self.simulate = simulate
         self.shutdown = threading.Event()
         self.restart_request = threading.Event()
+        self.reset_request = threading.Event()
         self.lock = threading.RLock()
         self.cond = threading.Condition()
         self.state = "starting"
@@ -640,6 +642,13 @@ class LiveCamera:
                     return
             if reason == "restart":
                 self._set_state("opening", "正在按新设置重新打开相机")
+            if reason == "reset":
+                if self.simulate:
+                    continue
+                self._set_state("waiting", "相机复位中，几秒后重新连接")
+                rd.reset_device(device)  # the camera leaves the USB bus and comes back, like a replug
+                self.shutdown.wait(6.0)
+                return
 
     def _open(self, host: StreamHost, after_start: Optional[Callable[[], None]]) -> None:
         """record_d455's start: plan, apply options, start the sensors and wait for a first frame of every
@@ -674,6 +683,9 @@ class LiveCamera:
             if self.restart_request.is_set():
                 self.restart_request.clear()
                 return "restart"
+            if self.reset_request.is_set():
+                self.reset_request.clear()
+                return "reset"
             if now - self.last_client > self.idle_after:
                 return "idle"
             video = [self.live[plan.name] for plan in host.plans if plan.kind == "video" and plan.name in self.live]
@@ -761,6 +773,14 @@ class LiveCamera:
         thread = self.record_thread
         if wait and thread is not None and thread.is_alive():
             thread.join(600)
+
+    def request_reset(self) -> None:
+        if self.recorder is not None:
+            raise RuntimeError("录制中不能复位相机，先停止录制")
+        if self.state != "streaming":
+            raise RuntimeError("相机没有在出图，现在不能复位")
+        self.event("info", "正在给相机发硬件复位，几秒后自动重新连接")
+        self.reset_request.set()
 
     def request_restart(self) -> None:
         if self.recorder is not None:
@@ -953,7 +973,7 @@ class LiveCamera:
                                 "exact": plan.exact, "rate": round(live.rate, 1) if live else 0.0})
         info = self.device_info
         camera = {
-            "state": self.state, "message": self.message, "simulated": self.simulate,
+            "state": self.state, "message": self.message, "simulated": self.simulate, "service": self.service,
             "name": info.get("name", ""), "serial": info.get("serial_number", ""),
             "firmware": info.get("firmware_version", ""), "usb": info.get("usb_type_descriptor", ""),
             "recommended_firmware": info.get("recommended_firmware_version", ""),
@@ -1560,6 +1580,7 @@ class StudioServer(ThreadingHTTPServer):
         self.camera = camera
         self.library = library
         self.allowed_hosts = allowed_hosts
+        self.on_restart: Optional[Callable[[], None]] = None
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -1757,6 +1778,17 @@ class StudioHandler(BaseHTTPRequestHandler):
         if parts == ["camera", "restart"]:
             camera.request_restart()
             return self._json({"ok": True})
+        if parts == ["camera", "reset"]:
+            camera.request_reset()
+            return self._json({"ok": True})
+        if parts == ["service", "restart"]:
+            if self.server.on_restart is None:
+                raise ApiError(409, "只有装成后台服务时才能从网页重启")
+            if camera.recorder is not None:
+                raise ApiError(409, "录制中不能重启服务，先停止录制")
+            self._json({"ok": True})
+            threading.Timer(0.3, self.server.on_restart).start()  # launchd starts it again (KeepAlive)
+            return None
         if parts == ["reveal-root"]:
             library.root.mkdir(parents=True, exist_ok=True)
             reveal_in_file_manager(library.root.resolve(), select=False)
@@ -1800,6 +1832,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="pause the camera after this many seconds without a live view (0: never; default %(default)s)")
     parser.add_argument("--log-dir", default="logs",
                         help="folder for start-hang reports (default ./logs, same as record_d455.py)")
+    parser.add_argument("--service", action="store_true", help=argparse.SUPPRESS)  # set by install_service.sh
     parser.add_argument("--no-sudo", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-usb-hold", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version="d455_studio.py {} (record_d455.py {})".format(
@@ -1846,6 +1879,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         log_dir=log_dir if log_dir.is_absolute() else HERE / log_dir, idle_after=args.idle_after)
     library = Library(out_root, camera)
     camera.library = library
+    camera.service = bool(args.service)
     port = args.port
     allowed = {"127.0.0.1:{}".format(port), "localhost:{}".format(port), "[::1]:{}".format(port)}
     if args.host not in ("127.0.0.1", "localhost"):
@@ -1875,6 +1909,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             os._exit(130)
         stopping.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
+
+    def restart_service() -> None:
+        """Exit so launchd's KeepAlive starts a fresh process; also the way out of an SDK call that never
+        returns, hence the hard deadline."""
+        rd.log("Restart requested from the page.")
+        deadline = threading.Timer(10.0, os._exit, args=(0,))
+        deadline.daemon = True
+        deadline.start()
+        handle_signal(0, None)
+
+    if args.service:
+        server.on_restart = restart_service
 
     for name in ("SIGINT", "SIGTERM"):
         try:

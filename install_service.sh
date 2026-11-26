@@ -6,6 +6,9 @@
 #   bash install_service.sh start      start it again
 #   bash install_service.sh uninstall  remove it (recordings are kept)
 # Options for install: --sessions DIR (default ~/D455/sessions), --port N (default 8455).
+# On a new Mac: install the Xcode command line tools once (xcode-select --install), then
+#   git clone https://github.com/Dongzl-2117/d455-recorder.git && cd d455-recorder && bash install_service.sh
+# Run the same command again after a git pull to update the service.
 #
 # What it sets up, and why:
 #   /Library/D455Studio/              program, its own Python and packages; owned by root and not writable by
@@ -108,15 +111,22 @@ case "${COMMAND}" in
 esac
 
 # ---------------------------------------------------------------------------------------------- install
-for file in record_d455.py d455_studio.py requirements.txt studio/index.html studio/app.js studio/style.css run.sh; do
-  [ -f "${SRC}/${file}" ] || die "缺少 ${file}，请在 d455_recorder 文件夹里运行这个脚本。"
+for file in record_d455.py d455_studio.py requirements.txt studio/index.html studio/app.js studio/style.css; do
+  [ -f "${SRC}/${file}" ] || die "缺少 ${file}，请在录制器文件夹（有 record_d455.py 的那个）里运行这个脚本。"
 done
+# The IMU crash guard is compiled at install time, and Apple's python3 bootstraps the installer: both come with
+# the Xcode command line tools. Without them /usr/bin/python3 would only pop up an installer dialog.
+if ! xcode-select -p >/dev/null 2>&1 || ! /usr/bin/python3 -c 'import venv' >/dev/null 2>&1; then
+  die "这台 Mac 还没有 Xcode 命令行工具。在终端运行 xcode-select --install ，在弹出的窗口里点安装（约 5 分钟），装完再运行这个脚本。"
+fi
 
 SESSIONS="${SESSIONS:-${USER_HOME}/D455/sessions}"
+EXTERNAL=0
 case "${SESSIONS}" in /*) ;; *) SESSIONS="${USER_HOME}/${SESSIONS}" ;; esac
 case "${SESSIONS}/" in
-  "${USER_HOME}/Desktop/"*|"${USER_HOME}/Documents/"*|"${USER_HOME}/Downloads/"*|"${USER_HOME}/Library/"*|/Volumes/*)
-    die "macOS 不允许后台服务写入 ${SESSIONS}（桌面、文稿、下载、外接盘都受保护）。换一个文件夹，例如默认的 ~/D455/sessions。" ;;
+  "${USER_HOME}/Desktop/"*|"${USER_HOME}/Documents/"*|"${USER_HOME}/Downloads/"*|"${USER_HOME}/Library/"*)
+    die "macOS 不允许后台服务写入 ${SESSIONS}（桌面、文稿、下载都受保护）。换一个文件夹，例如默认的 ~/D455/sessions。" ;;
+  /Volumes/*) EXTERNAL=1 ;;
 esac
 
 if [ -f "${PLIST}" ]; then
@@ -130,20 +140,16 @@ trap 'rm -rf "${WORK}"' EXIT
 chmod 700 "${WORK}"
 
 say "1/5 准备安装工具 uv（只用于这次安装）..."
-UV="$(command -v uv || true)"
-if [ -z "${UV}" ]; then
-  # The recorder's own .venv (created by run.sh as you) provides pip; uv comes from PyPI.
-  sudo -H -u "${USER_NAME}" bash "${SRC}/run.sh" --version >/dev/null || die "run.sh 没能准备好 Python 环境。"
-  mkdir -p "${WORK}/user" && chown "${USER_NAME}" "${WORK}/user"
-  sudo -H -u "${USER_NAME}" "${SRC}/.venv/bin/python" -m pip install --quiet --disable-pip-version-check \
-    --target "${WORK}/user/uv" uv || die "下载 uv 失败，请检查网络。"
-  found="$(find "${WORK}/user/uv" -path '*/bin/uv' -type f | head -n 1)"
-  [ -n "${found}" ] || die "uv 安装包里没有找到可执行文件。"
-  install -m 755 -o root -g wheel "${found}" "${WORK}/uv"  # root runs its own copy, not a file your account can change
-  UV="${WORK}/uv"
-fi
+export HOME="/var/root"  # nothing below may write root-owned files into your home folder
+# A throwaway environment from Apple's python3 (root-owned) fetches uv from PyPI; root never runs a file
+# that your account could have changed.
+/usr/bin/python3 -m venv "${WORK}/boot" || die "创建临时 Python 环境失败。"
+"${WORK}/boot/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir uv \
+  || die "下载 uv 失败，请检查网络（需要能访问 pypi.org）。"
+UV="${WORK}/boot/bin/uv"
+[ -x "${UV}" ] || die "uv 安装包里没有找到可执行文件。"
 export UV_CACHE_DIR="${WORK}/cache" UV_PYTHON_INSTALL_DIR="${PYROOT}" UV_PYTHON_BIN_DIR="${WORK}/bin" \
-       UV_PYTHON_PREFERENCE="only-managed" UV_LINK_MODE="copy" UV_NO_CONFIG=1 HOME="/var/root"
+       UV_PYTHON_PREFERENCE="only-managed" UV_LINK_MODE="copy" UV_NO_CONFIG=1
 
 say "2/5 安装服务专用的 Python ${PYTHON_VERSION}（下载约 25 MB，装好约 70 MB，在 ${PYROOT}）..."
 mkdir -p "${HOME_DIR}"
@@ -194,6 +200,7 @@ cat > "${PLIST}.new" <<PLIST_END
     <string>$(xml "${VENV}/bin/python")</string>
     <string>$(xml "${CODE}/d455_studio.py")</string>
     <string>--no-browser</string>
+    <string>--service</string>
     <string>--port</string><string>${PORT}</string>
     <string>--sessions</string><string>$(xml "${SESSIONS}")</string>
     <string>--settings</string><string>$(xml "${SETTINGS}")</string>
@@ -234,6 +241,12 @@ if wait_for_page; then
   say ""
   say "装好了。以后打开 ${URL} 就能看画面和录制，不需要再输密码（建议把这个网址加到书签）。"
   say "录制保存在 ${SESSIONS} ；快捷方式：${webloc}"
+  if [ "${EXTERNAL}" = 1 ]; then
+    say ""
+    say "录到外接盘还差一步：系统设置 > 隐私与安全性 > 完全磁盘访问权限，点 +，按 Command+Shift+G 输入下面这个路径并添加，"
+    say "然后运行 bash install_service.sh start："
+    say "  $(/usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASE_PY}")"
+  fi
   say "查看状态：bash install_service.sh status    卸载：bash install_service.sh uninstall"
   open_page
 else

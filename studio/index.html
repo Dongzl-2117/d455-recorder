@@ -139,7 +139,11 @@
     <div class="section">
       <h3>相机</h3>
       <dl class="kv" id="camera-kv"></dl>
-      <div class="actions"><button class="btn ghost small" id="camera-restart">重新打开相机</button></div>
+      <div class="actions">
+        <button class="btn ghost small" id="camera-restart" title="停下数据流再打开，几秒">重新打开相机</button>
+        <button class="btn ghost small" id="camera-reset" title="相机断开再重新连上，和拔插一次一样，约 10 秒">硬件复位</button>
+        <button class="btn ghost small" id="service-restart" title="后台程序退出后由系统自动重新启动，约 15 秒" hidden>重启后台服务</button>
+      </div>
     </div>
     <div class="section">
       <h3>日志</h3>

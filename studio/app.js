@@ -148,6 +148,7 @@ const display = {
 const FINDER = /Mac/i.test(navigator.platform || navigator.userAgent || "") ? "访达" : "文件夹";
 const fmtStamp = (text) => (text ? String(text).replace("T", " ").slice(0, 19) : null);
 
+const STATE_TEXT = { starting: "启动中", waiting: "等待相机接入", opening: "正在打开", streaming: "正常出图", idle: "待机", error: "出错", stopped: "已退出" };
 const STATUS_TEXT = { recording: "未结束", complete: "已完成", recovered: "已修复", unknown: "" };
 function sessionTag(item) {
   if (item.live) return ["live", "录制中"];
@@ -782,9 +783,11 @@ const settings = {
     const rows = [["型号", camera.name || "—"], ["序列号", camera.serial || "—"],
       ["固件", camera.firmware ? camera.firmware + (camera.recommended_firmware && camera.recommended_firmware !== camera.firmware ? `（SDK 推荐 ${camera.recommended_firmware}）` : "") : "—"],
       ["USB", camera.usb || "—"], ["深度单位", camera.depth_scale ? `${camera.depth_scale * 1000} mm / 每个数值` : "—"],
-      ["状态", camera.state + (camera.message ? " · " + camera.message : "")], ["录制器", "record_d455.py " + app.state.recorder_version]];
+      ["状态", (STATE_TEXT[camera.state] || camera.state) + (camera.message ? " · " + camera.message : "")], ["录制器", "record_d455.py " + app.state.recorder_version]];
     if (camera.macos) { rows.push(["IMU 防护", camera.macos.hid_guard]); rows.push(["USB 接管", camera.macos.usb_hold]); }
     $("#camera-kv").innerHTML = rows.map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join("");
+    $("#service-restart").hidden = !camera.service;
+    $("#camera-reset").disabled = camera.state !== "streaming" || !!app.state.recording;
   },
   renderLog(events, reset) {
     if (reset) this.log = [];
@@ -822,6 +825,12 @@ $("#cmap").onchange = () => display.set({ cmap: $("#cmap").value });
 $("#near").onchange = () => display.set({ near: clamp(Number($("#near").value), 0, 20) });
 $("#far").onchange = () => display.set({ far: clamp(Number($("#far").value), 0.2, 40) });
 $("#camera-restart").onclick = restartCamera;
+$("#camera-reset").onclick = async () => {
+  try { await api.post("/api/camera/reset"); toast("已发硬件复位，相机约 10 秒后重新连上"); } catch (error) { reportError(error); }
+};
+$("#service-restart").onclick = async () => {
+  try { await api.post("/api/service/restart"); toast("后台服务正在重启，约 15 秒后自动恢复", { timeout: 15000 }); } catch (error) { reportError(error); }
+};
 display.listeners.push(() => {
   for (const stage of [live.stage, player.stage]) for (const panel of stage.panels.values()) panel.updateLegend();
   $("#near").value = display.near; $("#far").value = display.far; $("#cmap").value = display.cmap;
