@@ -33,6 +33,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt || python -m pip install "pyrealsense2-macosx==2.54.2" numpy opencv-python "mcap>=1.0" "protobuf>=3.20"
+      - name: Launcher creates its own .venv (what a new user runs first)
+        if: runner.os != 'Windows'
+        run: bash run.sh --version
+      - name: Launcher creates its own .venv (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call run.bat --version
       - name: Recorder self test
         run: python record_d455.py selftest
       - name: Studio self check (no camera here, so warnings are expected)

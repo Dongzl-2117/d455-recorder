@@ -2100,7 +2100,24 @@ def check_usb(camera: Optional["LiveCamera"]) -> List[Dict[str, str]]:
         return [_finding("warn", "相机是 USB 2 连接（{}）".format(view["speed"]),
                          "USB 2 只有 480 Mb/s，默认的三路画面跑不满，会丢帧或打不开。",
                          "换一根 USB 3 数据线（标 5 Gb/s 或 10 Gb/s），把 USB-C 插头翻面再插一次，直接插电脑。", "usb")]
-    return [_finding("ok", "系统检测到相机，USB {}".format(view.get("speed") or "已连接"), key="usb")]
+    return [_finding("ok", "系统检测到相机，USB {}".format(view.get("speed") or "已连接"), key="usb")] + check_udev()
+
+
+UDEV_RULES = "99-realsense-libusb.rules"
+UDEV_COMMANDS = ("sudo curl -fsSL https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/{0} "
+                 "-o /etc/udev/rules.d/{0} && sudo udevadm control --reload-rules && sudo udevadm trigger"
+                 ).format(UDEV_RULES)
+
+
+def check_udev() -> List[Dict[str, str]]:
+    """Linux: without RealSense's udev rules only root can open the camera."""
+    if not sys.platform.startswith("linux") or running_as_root():
+        return []
+    if any(Path(folder, UDEV_RULES).is_file() for folder in ("/etc/udev/rules.d", "/lib/udev/rules.d", "/usr/lib/udev/rules.d")):
+        return []
+    return [_finding("warn", "还没装 RealSense 的 udev 规则，普通用户打不开相机",
+                     "Linux 默认只允许管理员直接访问这类 USB 设备。",
+                     "运行一次：" + UDEV_COMMANDS + "，然后拔插一次相机。", "udev")]
 
 
 def check_camera(camera: Optional["LiveCamera"]) -> List[Dict[str, str]]:
@@ -2450,9 +2467,13 @@ class StudioHandler(BaseHTTPRequestHandler):
             kind = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if kind not in ("application/json", "application/octet-stream"):
                 raise ApiError(415, "Content-Type must be application/json")
-        elif self.path.startswith("/api/") and self.headers.get("Sec-Fetch-Site", "none") not in ("none", "same-origin"):
-            # an image or script tag on another site must not wake the camera (links to the page itself are fine)
-            raise ApiError(403, "cross-site request refused")
+        elif self.path.startswith("/api/"):
+            # an image or script tag on another site must not wake the camera (links to the page itself are fine);
+            # browsers without Sec-Fetch-Site still send Origin on cross-site fetches
+            origin = self.headers.get("Origin")
+            if (self.headers.get("Sec-Fetch-Site", "none") not in ("none", "same-origin")
+                    or (origin and urllib.parse.urlparse(origin).netloc.lower() not in self.server.allowed_hosts)):
+                raise ApiError(403, "cross-site request refused")
 
     def do_HEAD(self) -> None:
         self.do_GET()

@@ -29,7 +29,14 @@ bash install_service.sh      # 先检查这台 Mac，再输一次开机密码，
 
 **Windows**：装好 Python 3.9 以上（安装时勾选 Add python.exe to PATH），双击 `studio.bat`。第一次会自动装依赖，之后浏览器自动打开网页。Windows 打开相机不需要管理员权限。
 
-**Linux**：`bash studio.sh`。和命令行录制一样，需要先装 RealSense 的 udev 规则，普通用户才能打开相机。
+**Linux**：`bash studio.sh`。Ubuntu 和 Debian 先装 `sudo apt install python3-venv`。和命令行录制一样，需要先装一次 RealSense 的 udev 规则，普通用户才能打开相机：
+
+```
+sudo curl -fsSL https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules -o /etc/udev/rules.d/99-realsense-libusb.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger     # 然后拔插一次相机
+```
+
+RealSense 的 Python 包只发布了 x86 电脑的版本；树莓派、Jetson 这类 ARM 的 Linux 没有现成的包。安装失败时脚本会说明是版本不对还是网络不通。
 
 不装服务也可以临时用：Mac 上 `bash studio.sh`，每次启动输一次密码。没有相机时 `bash studio.sh --simulate` 可以先看界面。
 

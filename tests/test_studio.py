@@ -262,6 +262,8 @@ def run(client, tmp, server, listener, port, exit_after):
     check(status == 415, "a POST a form on another site could send (text/plain) is refused", status)
     status, _h, _d = client.get("/api/state?want=1", headers={"Sec-Fetch-Site": "cross-site"})
     check(status == 403, "API requests from another site are refused (camera stays as it is)", status)
+    status, _h, _d = client.get("/api/state?want=1", headers={"Origin": "https://evil.example"})
+    check(status == 403, "... also from browsers that only send Origin", status)
     status, _h, _d = client.get("/", headers={"Sec-Fetch-Site": "cross-site"})
     check(status == 200, "a link to the page from another site still opens it", status)
     for bad in ("C:", "CON", "nul.mcap", "a.", "a ", "x:y"):
