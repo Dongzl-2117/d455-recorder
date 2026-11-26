@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import io
 import json
 import mimetypes
 import os
 import re
 import shutil
 import signal
+import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -50,8 +51,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import record_d455 as rd  # noqa: E402  (the recorder is the library)
 
-__version__ = "1.1.0"
-BUILT_AGAINST = "1.2.9"
+__version__ = "1.1.1"
+BUILT_AGAINST = "1.2.10"
 WEB_ROOT = HERE / "studio"
 SETTINGS_PATH = HERE / "studio_settings.json"
 DEFAULT_PORT = 8455
@@ -727,8 +728,8 @@ class LiveCamera:
                 color_codec=values["color_codec"], ir_codec=values["ir_codec"],
                 split_minutes=float(values["split_minutes"]), duration=max(0.0, float(duration or 0)),
                 scene={key: value for key, value in scene.items() if value}, quiet=True, preview=False)
+            guard_root(self.out_root)
             self.out_root.mkdir(parents=True, exist_ok=True)
-            rd.hand_back_ownership(self.out_root, recursive=False)
             recorder = StudioRecorder(self, host, config, threading.Event())
             self.recorder = recorder
             self.record_phase = "starting"
@@ -1051,8 +1052,9 @@ OP_SCHEMA, OP_CHANNEL, OP_MESSAGE, OP_CHUNK, OP_MESSAGE_INDEX = 0x03, 0x04, 0x05
 
 
 def is_mcap(path: Path) -> bool:
-    # "._name.mcap" are the resource-fork files macOS leaves next to every file on FAT/exFAT drives
-    return path.suffix.lower() == ".mcap" and not path.name.startswith(".")
+    # "._name.mcap" are the resource-fork files macOS leaves next to every file on FAT/exFAT drives.
+    # Links are not followed anywhere in the recordings folder (the macOS service reads it as root).
+    return path.suffix.lower() == ".mcap" and not path.name.startswith(".") and not path.is_symlink()
 
 
 def recording_files(path: Path) -> List[Path]:
@@ -1067,7 +1069,10 @@ def recording_files(path: Path) -> List[Path]:
 
 
 def is_session_dir(path: Path) -> bool:
-    return (path / "manifest.json").is_file() or (path / "recordings").is_dir()
+    if path.is_symlink():
+        return False
+    recordings = path / "recordings"
+    return (path / "manifest.json").is_file() or (recordings.is_dir() and not recordings.is_symlink())
 
 
 def mcap_span(paths: List[Path]) -> Optional[Tuple[int, int]]:
@@ -1450,9 +1455,75 @@ def first_image(directory: Path, prefer: Tuple[str, ...] = ("color", "ir_left", 
     return None
 
 
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM{}".format(n) for n in range(1, 10)} | {"LPT{}".format(n) for n in range(1, 10)}
+
+
 def valid_name(part: str) -> bool:
-    """One path component of a session id: any file name except hidden ones and anything with a separator."""
-    return 0 < len(part) <= 255 and not part.startswith(".") and not any(char in part for char in "/\\\x00")
+    """One path component of a session id: an ordinary file name that means the same on every system.
+    No hidden names, separators, drive letters (":" would leave the folder on Windows), control characters,
+    trailing dots or spaces, or the reserved device names of Windows."""
+    return (0 < len(part) <= 255 and not part.startswith(".") and part[-1] not in ". "
+            and not any(char in part for char in '/\\:*?"<>|') and all(ord(char) >= 32 for char in part)
+            and part.split(".")[0].upper() not in WINDOWS_RESERVED)
+
+
+# Where a recordings folder must never lead while the program runs as root (the macOS service): everything
+# written there is handed to the user, so a link into one of these would hand over system files.
+SYSTEM_PLACES = ("/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/etc", "/opt", "/cores", "/dev",
+                 "/private/etc", "/private/var/db", "/private/var/root", "/var/root", "/var/db", "/root", "/boot",
+                 "/proc", "/sys", "/snap")
+IMPORT_SUFFIXES = {".mcap", ".json", ".jsonl", ".csv", ".tsv", ".txt", ".md", ".log", ".yaml", ".yml",
+                   ".png", ".jpg", ".jpeg", ".npy", ".npz", ".ply", ".pcd", ".mp4"}
+
+
+def running_as_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+class UnsafeFolder(RuntimeError):
+    pass
+
+
+def unsafe_root(root: Path) -> str:
+    """Why the recordings folder may not be written to by this program, or "" when it may.
+
+    Only matters as root. `root` is the folder's real path, taken once at start; seeing a different real path
+    now means a component was swapped for a link since then. The folder must belong to the user (whom the
+    service writes for) and must not be a system location."""
+    if not running_as_root():
+        return ""
+    text = str(root)
+    real = os.path.realpath(text)
+    if real != text:
+        return "录像目录 {} 的路径里有替身或符号链接，现在指向 {}".format(text, real)
+    if any(real == place or real.startswith(place + "/") for place in SYSTEM_PLACES):
+        return "录像目录 {} 在系统文件夹里".format(real)
+    try:
+        info = os.lstat(real)
+    except FileNotFoundError:
+        return ""
+    except OSError as error:
+        return "读不了录像目录 {}：{}".format(real, error)
+    if not stat.S_ISDIR(info.st_mode):
+        return "录像目录 {} 不是一个普通文件夹".format(real)
+    user = os.environ.get("SUDO_UID", "")
+    unknown = real.startswith("/Volumes/") and info.st_uid == 99  # an external drive that ignores ownership
+    if user.isdigit() and info.st_uid != int(user) and not unknown:
+        return "录像目录 {} 不属于你的账户".format(real)
+    return ""
+
+
+def guard_root(root: Path) -> None:
+    problem = unsafe_root(root)
+    if problem:
+        raise UnsafeFolder(problem + "。为了安全，录制、导入和删除先停用了：把它改回你自己账户下的普通文件夹"
+                           "（不要用替身或符号链接），再运行 bash install_service.sh")
+
+
+def inside(path: Path, root: Path) -> bool:
+    """path is root or below it, with no link on the way (root itself is a real path)."""
+    real = os.path.realpath(str(path))
+    return real == str(path) and (real == str(root) or real.startswith(str(root).rstrip(os.sep) + os.sep))
 
 
 def tree_size(path: Path) -> int:
@@ -1491,12 +1562,15 @@ class Library:
         self.thumbs: Dict[str, Tuple[float, bytes]] = {}
         self.summaries: Dict[str, Tuple[Tuple, Dict[str, Any]]] = {}
         self.importing: Dict[str, float] = {}  # import name -> last activity (monotonic)
+        self.repair_lock = threading.Lock()
 
     def directory(self, session_id: str) -> Path:
         parts = (session_id or "").split("/")
         if not 1 <= len(parts) <= 2 or not all(valid_name(part) for part in parts):
             raise KeyError("bad session id")
         path = self.root.joinpath(*parts)
+        if not inside(path, self.root):  # a link on the way: never followed
+            raise KeyError("session not found")
         if path.is_dir() or (path.is_file() and is_mcap(path)):
             return path
         raise KeyError("session not found")
@@ -1508,7 +1582,7 @@ class Library:
     @staticmethod
     def _children(folder: Path) -> List[Path]:
         try:
-            return sorted(path for path in folder.iterdir() if not path.name.startswith("."))
+            return sorted(path for path in folder.iterdir() if valid_name(path.name) and not path.is_symlink())
         except OSError:
             return []
 
@@ -1666,6 +1740,7 @@ class Library:
         failed: List[Dict[str, str]] = []
         freed = 0
         live = self.live_session()
+        guard_root(self.root)
         for session_id in session_ids:
             try:
                 path = self.directory(str(session_id))
@@ -1683,10 +1758,12 @@ class Library:
                             raise RuntimeError("另一个程序正在往里面写（比如 run.sh 正在录制）")
                 size = tree_size(path)
                 self.forget(session_id)
+                if not inside(path, self.root):
+                    raise KeyError("session not found")
                 if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(str(path))
                 else:
-                    path.unlink()  # a loose file, or a link to a folder elsewhere (the folder itself stays)
+                    path.unlink()  # a loose file
                 deleted.append(session_id)
                 freed += size
                 rd.log("[studio] deleted {} ({:.1f} MB)".format(session_id, size / 1e6))
@@ -1702,38 +1779,67 @@ class Library:
 
     def clean_imports(self) -> None:
         """Half-finished imports of an earlier run (the page was closed during the upload)."""
+        if unsafe_root(self.root):
+            return
         try:
-            leftovers = [path for path in self.root.iterdir() if path.name.startswith(self.IMPORT_PREFIX)]
+            leftovers = [path for path in self.root.iterdir()
+                         if path.name.startswith(self.IMPORT_PREFIX) and not path.is_symlink()]
         except OSError:
             return
         for path in leftovers:
             shutil.rmtree(str(path), ignore_errors=True)
 
-    def import_begin(self, name: str, total: int) -> Dict[str, Any]:
+    def _check_staging(self, staging: Path) -> None:
+        """The staging folder is ours (created by this program) and still where we made it: the recordings
+        folder belongs to the user, who could otherwise swap it for a link between two uploads."""
+        guard_root(self.root)
+        info = os.lstat(str(staging))
+        if not stat.S_ISDIR(info.st_mode) or not inside(staging, self.root) or (
+                running_as_root() and info.st_uid != 0):
+            raise UnsafeFolder("导入用的临时文件夹被换掉了，这次导入已停止")
+
+    def import_begin(self, name: str, total: int, kind: str = "folder") -> Dict[str, Any]:
         staging = self._staging(name)
-        if (self.root / name).exists():
+        if kind == "file" and not is_mcap(Path(name)):
+            raise ValueError("单个文件只能导入 .mcap：{}".format(name))
+        guard_root(self.root)
+        if os.path.lexists(str(self.root / name)):
             raise FileExistsError("已经有一个叫 {} 的录制".format(name))
         free = shutil.disk_usage(str(self.root)).free
         if total + 2e9 > free:
             raise RuntimeError("空间不够：需要 {:.1f} GB，剩 {:.1f} GB".format(total / 1e9, free / 1e9))
-        if staging.exists():
-            shutil.rmtree(str(staging), ignore_errors=True)
-        staging.mkdir(parents=True)
+        if os.path.lexists(str(staging)):
+            if staging.is_symlink():
+                staging.unlink()
+            else:
+                shutil.rmtree(str(staging), ignore_errors=True)
+        staging.mkdir()
+        self._check_staging(staging)
         self.importing[name] = time.monotonic()
         return {"ok": True}
 
-    def import_file(self, name: str, relative: str, length: int, source: Any, mtime: float = 0.0) -> None:
+    @staticmethod
+    def importable(relative: str) -> bool:
+        """Recording data only: never a program, a library or a link a root process could be tricked into using."""
+        return Path(relative).suffix.lower() in IMPORT_SUFFIXES
+
+    def import_file(self, name: str, relative: str, length: int, source: Any, mtime: float = 0.0) -> bool:
+        """Store one uploaded file. False when the file is not recording data and was left out."""
         staging = self._staging(name)
-        if name not in self.importing or not staging.is_dir():
+        if name not in self.importing or not os.path.lexists(str(staging)):
             raise RuntimeError("这次导入已经结束或被取消")
         parts = relative.split("/")
         if not 1 <= len(parts) <= 4 or not all(valid_name(part) for part in parts):
             raise ValueError("不能导入这个文件：{}".format(relative))
+        if not self.importable(relative):
+            return False
+        self._check_staging(staging)
         target = staging.joinpath(*parts)
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_name(target.name + ".part")
         remaining = length
-        with partial.open("wb") as handle:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(str(partial), flags, 0o644), "wb") as handle:
             while remaining > 0:
                 block = source.read(min(remaining, 1 << 20))
                 if not block:
@@ -1750,15 +1856,26 @@ class Library:
                 os.utime(str(target), (mtime, mtime))
             except OSError:
                 pass
+        return True
 
     def import_finish(self, name: str, kind: str) -> Dict[str, Any]:
-        staging = self._staging(name)
         if name not in self.importing:
             raise RuntimeError("这次导入已经结束或被取消")
+        try:
+            return self._import_finish(name, kind)
+        except Exception:
+            self.import_cancel(name)
+            raise
+
+    def _import_finish(self, name: str, kind: str) -> Dict[str, Any]:
+        staging = self._staging(name)
         target = self.root / name
-        if target.exists():
+        if os.path.lexists(str(target)):
             raise FileExistsError("已经有一个叫 {} 的录制".format(name))
+        self._check_staging(staging)
         if kind == "file":
+            if not is_mcap(Path(name)):
+                raise ValueError("单个文件只能导入 .mcap：{}".format(name))
             (staging / name).replace(target)
             shutil.rmtree(str(staging), ignore_errors=True)
         else:
@@ -1769,14 +1886,36 @@ class Library:
         rd.log("[studio] imported {} ({:.1f} MB)".format(name, tree_size(target) / 1e6))
         return {"id": name}
 
+    # ---- repairing ----------------------------------------------------------------------------
+    def repair(self, session_id: str, directory: Path) -> Dict[str, Any]:
+        """`record_d455.py repair` in a child process: its output stays out of this program's log, a crash in
+        it cannot take the service down, and only one runs at a time."""
+        if not self.repair_lock.acquire(blocking=False):
+            raise RuntimeError("正在修复另一个录制，等它完成")
+        try:
+            self.forget(session_id)
+            rd.log("[studio] repairing {}".format(session_id))
+            env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+            env.pop("DYLD_INSERT_LIBRARIES", None)  # no camera in a repair
+            done = subprocess.run([sys.executable, str(HERE / "record_d455.py"), "repair", str(directory)],
+                                  cwd=str(HERE), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, timeout=4 * 3600)
+            text = done.stdout.decode("utf-8", "replace")
+            rd.log("[studio] repair of {} finished with code {}".format(session_id, done.returncode))
+            return {"code": done.returncode, "log": text[-4000:]}
+        finally:
+            self.forget(session_id)
+            self.repair_lock.release()
+
     def import_cancel(self, name: str) -> None:
         staging = self._staging(name)
         self.importing.pop(name, None)
-        shutil.rmtree(str(staging), ignore_errors=True)
+        if not staging.is_symlink():
+            shutil.rmtree(str(staging), ignore_errors=True)
 
     def busy(self) -> bool:
         now = time.monotonic()
-        return any(now - seen < 120 for seen in self.importing.values())
+        return self.repair_lock.locked() or any(now - seen < 120 for seen in self.importing.values())
 
 
 # --------------------------------------------------------------------------------------------
@@ -2011,10 +2150,19 @@ def _version_tuple(text: str) -> Tuple[int, ...]:
 
 
 def check_storage(out_root: Path) -> List[Dict[str, str]]:
+    problem = unsafe_root(out_root)
+    if problem:
+        return [_finding("bad", "录像目录不安全，录制、导入和删除已停用", problem,
+                         "把它改回你自己账户下的普通文件夹（不要用替身或符号链接），再运行 bash install_service.sh。",
+                         "storage")]
     try:
         out_root.mkdir(parents=True, exist_ok=True)
         probe = out_root / ".d455_write_test"
-        probe.write_bytes(b"ok")
+        if os.path.lexists(str(probe)):
+            probe.unlink()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(str(probe), flags, 0o600), "wb") as handle:
+            handle.write(b"ok")
         probe.unlink()
     except OSError as error:
         known = explain(str(error))
@@ -2197,7 +2345,14 @@ def launchd_socket(name: str) -> Any:
 
 class StudioServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR lets a second program bind a port that is already listening, so two copies
+    # would share the port (and fight over the camera); there the port is taken exclusively instead.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, address: Tuple[str, int], camera: LiveCamera, library: Library, allowed_hosts: set,
                  listen_socket: Any = None) -> None:
@@ -2290,6 +2445,14 @@ class StudioHandler(BaseHTTPRequestHandler):
             origin = self.headers.get("Origin")
             if origin and urllib.parse.urlparse(origin).netloc.lower() not in self.server.allowed_hosts:
                 raise ApiError(403, "cross-origin request refused")
+            # Only body types a web page can send to another site after asking first (CORS preflight, which
+            # this server never grants): a form or a no-cors fetch from another page cannot get through.
+            kind = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if kind not in ("application/json", "application/octet-stream"):
+                raise ApiError(415, "Content-Type must be application/json")
+        elif self.path.startswith("/api/") and self.headers.get("Sec-Fetch-Site", "none") not in ("none", "same-origin"):
+            # an image or script tag on another site must not wake the camera (links to the page itself are fine)
+            raise ApiError(403, "cross-site request refused")
 
     def do_HEAD(self) -> None:
         self.do_GET()
@@ -2424,12 +2587,19 @@ class StudioHandler(BaseHTTPRequestHandler):
             if length < 0:
                 raise ApiError(411, "Content-Length required")
             try:
-                library.import_file(query.get("name", ""), query.get("path", ""), length, self.rfile,
-                                    float(query.get("mtime", "0") or 0))
+                stored = library.import_file(query.get("name", ""), query.get("path", ""), length, self.rfile,
+                                             float(query.get("mtime", "0") or 0))
             except Exception:
                 self.close_connection = True  # the rest of the body may still be on the wire
                 raise
-            return self._json({"ok": True})
+            if not stored:  # not recording data: read past it and leave it out
+                remaining = length
+                while remaining > 0:
+                    block = self.rfile.read(min(remaining, 1 << 20))
+                    if not block:
+                        break
+                    remaining -= len(block)
+            return self._json({"ok": True, "skipped": not stored})
         body = self._body()
         if parts == ["sessions", "delete"]:
             ids = body.get("ids")
@@ -2437,7 +2607,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 raise ApiError(400, "ids: a list of session ids")
             return self._json(library.delete([str(item) for item in ids]))
         if parts == ["import", "begin"]:
-            return self._json(library.import_begin(str(body.get("name", "")), int(body.get("bytes") or 0)))
+            return self._json(library.import_begin(str(body.get("name", "")), int(body.get("bytes") or 0),
+                                                   str(body.get("kind", "folder"))))
         if parts == ["import", "finish"]:
             return self._json(library.import_finish(str(body.get("name", "")), str(body.get("kind", "folder"))))
         if parts == ["import", "cancel"]:
@@ -2508,16 +2679,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             if action == "repair":
                 if session_id == library.live_session():
                     raise ApiError(409, "这个 session 正在录制")
-                library.forget(session_id)
-                output = io.StringIO()
-                original = sys.stdout
-                try:
-                    sys.stdout = output
-                    code = rd.command_repair(argparse.Namespace(session=[str(directory)], force=False))
-                finally:
-                    sys.stdout = original
-                library.forget(session_id)
-                return self._json({"code": code, "log": output.getvalue()[-4000:]})
+                guard_root(library.root)
+                return self._json(library.repair(session_id, directory))
         raise ApiError(404, "not found")
 
 
@@ -2607,9 +2770,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_root = Path(args.sessions).expanduser()
     if not out_root.is_absolute():
         out_root = HERE / out_root
-    out_root.mkdir(parents=True, exist_ok=True)
-    rd.hand_back_ownership(out_root, recursive=False)
-    for leftover in rd.unfinished_sessions(out_root):
+    out_root = Path(os.path.realpath(str(out_root)))  # from here on every write is checked against this path
+    problem = unsafe_root(out_root)
+    if not problem and not os.path.lexists(str(out_root)):
+        out_root.mkdir(parents=True)
+        rd.hand_back_ownership(out_root, recursive=False)
+        problem = unsafe_root(out_root)
+    if problem:
+        rd.log("WARNING: {}. Recording, import and delete are off until this is fixed.".format(problem))
+    for leftover in ([] if problem else rd.unfinished_sessions(out_root)):
         rd.log("Note: session {} was never closed; the studio can repair it from the session list.".format(leftover.name))
     settings = Settings(Path(args.settings).expanduser() if args.settings else SETTINGS_PATH)
     log_dir = Path(args.log_dir)
@@ -2685,8 +2854,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
             quiet = server.unused_for()
             if quiet >= limit:
-                quit_program("No page open for {:.0f} s and nothing recording: exiting, which frees the camera "
-                             "and the memory.".format(quiet))
+                quit_program("No page open for {:.0f} s and nothing recording: exiting, which frees the CPU and "
+                             "the memory.".format(quiet))
                 return
 
     if args.service:

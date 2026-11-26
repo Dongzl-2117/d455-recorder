@@ -40,6 +40,10 @@ jobs:
         continue-on-error: true
       - name: Studio end to end
         run: python tests/test_studio.py
+      - name: Root safety (links, foreign folders and imports under the root service)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sudo "$(command -v python)" tests/test_root_safety.py
 
   page:
     name: web page in Chromium

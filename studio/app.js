@@ -479,8 +479,8 @@ function showClosed(service) {
   $("#closed-glyph").innerHTML = icon("power");
   $("#closed-title").textContent = service ? "后台服务已关闭" : "D455 Studio 已退出";
   $("#closed-text").textContent = service
-    ? "相机已经交还给系统，CPU 和内存也都释放了。再打开或刷新这个网页时会自动启动，不需要密码。"
-    : "相机已经释放。要再用，在终端重新运行 studio.sh（Windows：studio.bat）。";
+    ? "CPU 和内存都释放了。再打开或刷新这个网页时会自动启动，不需要密码。"
+    : "要再用，在终端重新运行 studio.sh（Windows：studio.bat）。";
   $("#closed-reopen").hidden = !service;
   $("#closed").hidden = false;
 }
@@ -893,7 +893,7 @@ const settings = {
     $("#service-quit").innerHTML = icon("power") + (camera.service ? "关闭后台服务" : "退出程序");
     $("#service-quit").disabled = !!app.state.recording;
     $("#service-note").textContent = camera.service
-      ? (app.state.exit_after ? `后台服务按需运行：打开这个网页时自动启动，网页关掉 ${Math.round(app.state.exit_after / 60)} 分钟后（没有在录制）自动退出，退出后不占 CPU 和内存，相机交还系统。` : "")
+      ? (app.state.exit_after ? `后台服务按需运行：打开这个网页时自动启动，网页关掉 ${Math.round(app.state.exit_after / 60)} 分钟后（没有在录制）自动退出，退出后不占 CPU 和内存。` : "")
       : "这个程序是在终端里启动的，关掉终端窗口或按 Ctrl+C 也会退出。";
   },
   renderLog(events, reset) {
@@ -1128,6 +1128,7 @@ $("#select-delete").onclick = () => library.remove([...library.chosen]);
 // importing recordings copied from elsewhere: the browser reads the files and uploads them, so this works
 // even where the macOS service itself may not look (Desktop, Downloads, a USB stick)
 // ---------------------------------------------------------------------------------------------
+const IMPORT_SUFFIX = /\.(mcap|jsonl?|csv|tsv|txt|md|log|ya?ml|png|jpe?g|npy|npz|ply|pcd|mp4)$/i;  // same list as the server
 const importer = {
   running: false,
   cancelled: false,
@@ -1188,8 +1189,11 @@ const importer = {
       }
       if (root) {
         const name = root.split("/").pop();
+        const rel = parts.slice(root.split("/").length).join("/");
+        // recording data only (the server refuses anything else); derived/export is rebuilt by `export`
+        if (!IMPORT_SUFFIX.test(rel) || rel.startsWith("derived/export/")) continue;
         const group = groups.get("d:" + root) || { name, kind: "folder", files: [], bytes: 0 };
-        group.files.push({ file: item.file, rel: parts.slice(root.split("/").length).join("/") });
+        group.files.push({ file: item.file, rel });
         group.bytes += item.file.size;
         groups.set("d:" + root, group);
       } else if (/\.mcap$/i.test(parts[parts.length - 1])) {

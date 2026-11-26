@@ -4,9 +4,10 @@
 #   bash install_service.sh doctor     check this Mac, the camera connection and the service; explains problems
 #   bash install_service.sh status     installed? running right now?
 #   bash install_service.sh logs       the service's log
-#   bash install_service.sh stop       switch it off completely, also after a reboot (frees port and camera)
+#   bash install_service.sh stop       switch it off completely, also after a reboot (frees the port)
 #   bash install_service.sh start      switch it on again
 #   bash install_service.sh uninstall  remove it (recordings are kept)
+# Stop, update and uninstall refuse while a recording is running (--force: do it anyway).
 # Options for install: --sessions DIR (default ~/D455/sessions), --port N (default 8455),
 #   --index-url URL (a PyPI mirror), --python-mirror URL (a mirror of python-build-standalone),
 #   when pypi.org or github.com are slow or blocked on this network.
@@ -16,8 +17,9 @@
 #
 # How it runs: on demand. Nothing of it runs at boot; launchd (part of macOS, always running) only keeps
 # port 8455 open. Opening the page starts the program (a few seconds), and it exits by itself 5 minutes after
-# the last page was closed if nothing is recording. Then it uses no CPU or memory and macOS gets the camera
-# back. The page also has a button to close it right away. Starting and closing it never needs a password.
+# the last page was closed if nothing is recording. Then it uses no CPU or memory. (macOS itself does not
+# take the camera back after that; Photo Booth and video calls see it again after a replug.) The page also has
+# a button to close it right away. Starting and closing it never needs a password.
 #
 # What it sets up, and why:
 #   /Library/D455Studio/              program, its own Python and packages; owned by root and not writable by
@@ -59,6 +61,7 @@ PORT=""
 INDEX_URL=""
 PYTHON_MIRROR=""
 NO_BROWSER=""
+FORCE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     install|uninstall|status|start|stop|restart|logs|doctor) COMMAND="$1" ;;
@@ -68,6 +71,7 @@ while [ $# -gt 0 ]; do
     --python-mirror) PYTHON_MIRROR="${2:?--python-mirror 后面要跟一个网址}"; shift ;;
     --exit-after) EXIT_AFTER="${2:?}"; shift ;;  # tests
     --no-browser) NO_BROWSER=1 ;;
+    --force) FORCE=1 ;;  # stop / update / uninstall even while a recording is running
     -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) die "不认识的参数 $1（bash install_service.sh --help 查看用法）" ;;
   esac
@@ -261,13 +265,28 @@ case "${COMMAND}" in
     doctor; exit 0 ;;
 esac
 
+# Stopping the service ends a running recording, and launchd kills a program that takes long to close it.
+# Ask only a program that is running: a request would start a stopped one.
+recording_now() {
+  local pid
+  pid="$(launchctl print "system/${LABEL}" 2>/dev/null | awk '/^[[:space:]]*pid = /{ print $3; exit }' || true)"
+  [ -n "${pid}" ] || return 1
+  curl -fsS --max-time 3 "${URL}api/state" 2>/dev/null | grep -Eq '"recording": ?\{'
+}
+case "${COMMAND}" in
+  install|stop|start|restart|uninstall)
+    if [ -f "${PLIST}" ] && [ -z "${FORCE}" ] && recording_now; then
+      die "D455 Studio 正在录制。先在网页里停止录制，再运行这个命令（一定要现在停：加 --force，录制会被收尾保存）。"
+    fi ;;
+esac
+
 if [ "$(id -u)" -ne 0 ]; then
   [ "${COMMAND}" = "install" ] && preflight
   say "需要管理员权限。如果提示 Password，请输入这台 Mac 的登录密码（输入时不显示字符）。"
   [ "${COMMAND}" = "install" ] && say "这是唯一一次：装好以后打开网页就能录，服务自己按需启动和退出，不再要密码。"
   exec sudo /bin/bash "$0" "${COMMAND}" ${SESSIONS:+--sessions "${SESSIONS}"} --port "${PORT}" \
     ${INDEX_URL:+--index-url "${INDEX_URL}"} ${PYTHON_MIRROR:+--python-mirror "${PYTHON_MIRROR}"} --exit-after "${EXIT_AFTER}" \
-    ${NO_BROWSER:+--no-browser}
+    ${NO_BROWSER:+--no-browser} ${FORCE:+--force}
 fi
 USER_NAME="${SUDO_USER:-}"
 [ -n "${USER_NAME}" ] && [ "${USER_NAME}" != "root" ] || die "请在自己的账户里运行 bash install_service.sh（不要先切换到 root）。"
@@ -302,7 +321,7 @@ case "${COMMAND}" in
   stop)
     stop_service
     launchctl disable "system/${LABEL}" >/dev/null 2>&1 || true
-    say "已关闭：端口 ${PORT} 不再监听，重启电脑后也不会再启动，相机完全交给系统。bash install_service.sh start 重新打开。"
+    say "已关闭：端口 ${PORT} 不再监听，重启电脑后也不会再启动。bash install_service.sh start 重新打开。"
     exit 0 ;;
   start|restart)
     [ -f "${PLIST}" ] || die "还没有安装，先运行 bash install_service.sh"
@@ -451,6 +470,7 @@ cat > "${PLIST}.new" <<PLIST_END
   </dict>
   <key>WorkingDirectory</key><string>$(xml "${CODE}")</string>
   <key>ThrottleInterval</key><integer>5</integer>
+  <key>ExitTimeOut</key><integer>120</integer>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>$(xml "${LOGS}/studio.log")</string>
   <key>StandardErrorPath</key><string>$(xml "${LOGS}/studio.log")</string>

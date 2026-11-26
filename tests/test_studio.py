@@ -170,6 +170,14 @@ def run(client, tmp, server, listener, port, exit_after):
         check(status == 200 and headers.get("Content-Type") == "image/jpeg" and len(data) > 1000,
               "live image " + name, status)
 
+    print("one program per port")
+    second = subprocess.run([sys.executable, str(ROOT / "d455_studio.py"), "--simulate", "--no-browser", "--port", str(port),
+                             "--sessions", str(tmp / "second"), "--settings", str(tmp / "second.json"),
+                             "--log-dir", str(tmp / "second-logs")], cwd=str(ROOT), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=120, env=dict(os.environ, PYTHONUTF8="1"))
+    check(second.returncode != 0 and b"already running" in second.stdout,
+          "a second copy on the same port stops with a clear message", second.stdout[-300:])
+
     print("options")
     status, options = client.json("GET", "/api/options")
     check(status == 200 and "color" in options, "GET /api/options", status)
@@ -250,6 +258,66 @@ def run(client, tmp, server, listener, port, exit_after):
     status, _h, _d = client.request("POST", "/api/import/file?" + urllib.parse.urlencode({"name": "probe", "path": "../../x"}), raw=b"x")
     check(status in (400, 409) and not (tmp / "x").exists(), "import path with .. refused", status)
     client.json("POST", "/api/import/cancel", {"name": "probe"})
+    status, _h, _d = client.request("POST", "/api/record/stop", raw=b"{}", headers={"Content-Type": "text/plain"})
+    check(status == 415, "a POST a form on another site could send (text/plain) is refused", status)
+    status, _h, _d = client.get("/api/state?want=1", headers={"Sec-Fetch-Site": "cross-site"})
+    check(status == 403, "API requests from another site are refused (camera stays as it is)", status)
+    status, _h, _d = client.get("/", headers={"Sec-Fetch-Site": "cross-site"})
+    check(status == 200, "a link to the page from another site still opens it", status)
+    for bad in ("C:", "CON", "nul.mcap", "a.", "a ", "x:y"):
+        status, _a = client.json("GET", "/api/sessions/{}/timeline".format(quote(bad)))
+        check(status in (400, 404), "name with a special meaning on Windows refused: " + repr(bad), status)
+
+    print("import keeps recording data only")
+    script = tmp / "evil.py"
+    script.write_text("print('owned')\n")
+    status, _a = upload_session(client, "evil.py", script, kind="file")
+    check(status in (400, 409) and not (sessions / "evil.py").exists(), "a single file must be .mcap", status)
+    bundle = tmp / "bundle"
+    shutil.copytree(str(source), str(bundle))
+    (bundle / "payload.py").write_text("print('owned')\n")
+    (bundle / "derived" / "lib.so").write_bytes(b"\x7fELF")
+    status, answer = upload_session(client, "with extras", bundle)
+    imported = sessions / "with extras"
+    check(status == 200 and (imported / "manifest.json").is_file() and any((imported / "recordings").glob("*.mcap"))
+          and not (imported / "payload.py").exists() and not (imported / "derived" / "lib.so").exists(),
+          "a folder import keeps the recording data and leaves programs out", answer)
+
+    if os.name == "posix":  # links in the recordings folder are never followed (the macOS service runs as root)
+        print("links")
+        outside = tmp / "outside"
+        shutil.copytree(str(source), str(outside / "victim"))
+        os.symlink(str(outside / "victim"), str(sessions / "linked"))
+        os.symlink(str(outside), str(sessions / "hop"))
+        os.symlink(str(mcap), str(sessions / "link.mcap"))
+        status, listing = client.json("GET", "/api/sessions")
+        listed = [item["id"] for item in listing["sessions"]]
+        check(not any(key in listed for key in ("linked", "hop/victim", "link.mcap")), "links are not listed", listed)
+        for session_id in ("linked", "hop/victim", "link.mcap"):
+            status, _a = client.json("GET", "/api/sessions/{}/timeline".format(quote(session_id)))
+            check(status == 404, "a link is not opened: " + session_id, status)
+        status, answer = client.json("POST", "/api/sessions/delete", {"ids": ["linked", "hop/victim", "link.mcap"]})
+        check(status == 200 and not answer["deleted"] and (outside / "victim" / "manifest.json").is_file()
+              and mcap.is_file(), "deleting through a link removes nothing", answer)
+        for name in ("linked", "hop", "link.mcap"):
+            os.unlink(str(sessions / name))
+
+    print("repair")
+    broken = sessions / "broken"
+    shutil.copytree(str(source), str(broken))
+    damaged = sorted((broken / "recordings").glob("*.mcap"))[0]
+    with damaged.open("r+b") as handle:
+        handle.truncate(int(damaged.stat().st_size * 0.7))  # as if the power went out: no summary, no footer
+    old_time = time.time() - 120
+    for path in broken.rglob("*"):
+        os.utime(str(path), (old_time, old_time))
+    status, answer = client.json("POST", "/api/sessions/broken/repair", timeout=300)
+    check(status == 200 and answer.get("code") == 0 and "kept" in answer.get("log", ""), "repair a cut-off recording",
+          answer)
+    status, timeline = client.json("GET", "/api/sessions/broken/timeline")
+    check(status == 200 and timeline.get("duration_ms", 0) > 500, "the repaired recording plays", status)
+    for name in ("broken", "with extras"):
+        shutil.rmtree(str(sessions / name))
 
     print("delete")
     victims = ["copied A", "loose.mcap", "外部 拷贝/session x"]
