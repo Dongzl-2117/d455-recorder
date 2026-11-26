@@ -1871,6 +1871,17 @@ def check_system() -> List[Dict[str, str]]:
 def check_python(rs: Any) -> List[Dict[str, str]]:
     import platform
     version = getattr(rs, "__version__", "") if rs is not None else ""
+    if rs is not None and not version:  # pyrealsense2-macosx has no __version__
+        try:
+            from importlib import metadata
+            for package in ("pyrealsense2-macosx", "pyrealsense2"):
+                try:
+                    version = metadata.version(package) + ("（macOS 社区版）" if package.endswith("macosx") else "")
+                    break
+                except metadata.PackageNotFoundError:
+                    continue
+        except Exception:
+            pass
     if rs is None:
         return [_finding("bad", "pyrealsense2 没有装好", "Python 导入 RealSense SDK 失败。",
                          "macOS：重新运行 bash install_service.sh；Windows / Linux：删掉 .venv 文件夹再运行 studio.bat / studio.sh。",
@@ -2544,6 +2555,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def doctor(args: argparse.Namespace) -> int:
     """`--doctor`: the self check in a terminal, without opening the camera (safe next to a running service)."""
+    if not sys.stdout.isatty():  # piped into a file or another program: UTF-8, whatever the code page
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     print("D455 Studio {} 自检".format(__version__))
     print()
     rs = None

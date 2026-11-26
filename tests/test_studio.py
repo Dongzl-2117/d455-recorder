@@ -113,6 +113,11 @@ def upload_session(client, name, folder, kind="folder"):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # Windows CI: a pipe in the ANSI code page cannot show Chinese
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     tmp = Path(tempfile.mkdtemp(prefix="studio-test-"))
     print("work folder:", tmp)
     listener = None

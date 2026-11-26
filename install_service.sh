@@ -476,7 +476,8 @@ sudo -u "${USER_NAME}" "${VENV}/bin/python" "${CODE}/d455_studio.py" --doctor --
   --log-dir "${LOGS}" | sed -n '3,$p' || true
 say ""
 say "装好了。以后打开 ${URL} 就能看画面和录制，不需要再输密码（建议把这个网址加到书签）。"
-say "服务按需运行：打开网页时自动启动，网页关掉 $((EXIT_AFTER / 60)) 分钟后自动退出，平时不占 CPU 和内存。"
+if [ "${EXIT_AFTER}" -ge 120 ]; then wait_text="$((EXIT_AFTER / 60)) 分钟"; else wait_text="${EXIT_AFTER} 秒"; fi
+say "服务按需运行：打开网页时自动启动，网页关掉 ${wait_text}后自动退出，平时不占 CPU 和内存。"
 say "录制保存在 ${SESSIONS} ；快捷方式：${webloc}"
 if [ "${EXTERNAL}" = 1 ]; then
   say ""
