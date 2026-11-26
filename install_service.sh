@@ -145,7 +145,7 @@ fi
 export UV_CACHE_DIR="$WORK/cache" UV_PYTHON_INSTALL_DIR="$PYROOT" UV_PYTHON_BIN_DIR="$WORK/bin" \
        UV_PYTHON_PREFERENCE="only-managed" UV_LINK_MODE="copy" UV_NO_CONFIG=1 HOME="/var/root"
 
-say "2/5 安装服务专用的 Python $PYTHON_VERSION（约 40 MB，装在 $PYROOT）..."
+say "2/5 安装服务专用的 Python $PYTHON_VERSION（下载约 25 MB，装好约 70 MB，在 $PYROOT）..."
 mkdir -p "$HOME_DIR"
 "$UV" python install "$PYTHON_VERSION" >/dev/null || die "下载 Python 失败，请检查网络（需要能访问 github.com）。"
 BASE_PY="$("$UV" python find "$PYTHON_VERSION")" || die "装好的 Python 找不到。"
