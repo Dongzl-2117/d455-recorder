@@ -34,6 +34,7 @@ const ICONS = {
   power: '<path d="M12 3.5v8M7.2 6.4a7.5 7.5 0 1 0 9.6 0"/>',
   chevron: '<path d="M14.5 5.5 8 12l6.5 6.5"/>',
   ok: '<circle cx="12" cy="12" r="8.5"/><path d="M8.3 12.3l2.5 2.5 4.9-5.1"/>',
+  tick: '<path d="M6.5 12.5 10 16l7.5-8"/>',  // bare check, centred on (12, 12)
 };
 function icon(name, extra = "") {
   const body = ICONS[name] || "";
@@ -1040,7 +1041,7 @@ const library = {
       const line3 = line2 === facts ? (scene ? "" : origin && origin !== line2 ? origin : "") : facts;
       const chosen = this.chosen.has(item.id);
       html += `<button class="card ${item.id === this.selected && !this.selecting ? "active" : ""} ${chosen ? "chosen" : ""} ${item.live ? "is-live" : ""}" data-id="${esc(item.id)}" title="${esc(item.id)}">
-        <div class="thumb" data-src="/api/sessions/${encodeURIComponent(item.id)}/thumb">${item.duration_s != null ? `<span class="dur">${fmtDuration(item.duration_s)}</span>` : ""}<span class="tick">${icon("ok")}</span></div>
+        <div class="thumb" data-src="/api/sessions/${encodeURIComponent(item.id)}/thumb">${item.duration_s != null ? `<span class="dur">${fmtDuration(item.duration_s)}</span>` : ""}<span class="tick">${icon("tick")}</span></div>
         <div class="meta"><div class="line1"><span class="time">${timeOf(date)}</span>${tag}</div><div class="line2">${esc(line2)}</div>
         <div class="line2">${esc(line3)}</div></div></button>`;
     }

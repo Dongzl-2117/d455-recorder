@@ -93,6 +93,15 @@ const check = (ok, what, detail = "") => { console.log((ok ? "  ok    " : "  FAI
     await page.click("#session-list .card[data-id='loose.mcap']");
     await page.click("#session-list .card[data-id='copied session']");
     await page.screenshot({ path: path.join(SHOTS, "select.png") });
+    const badge = await page.evaluate(() => {
+      const tick = document.querySelector("#session-list .card.chosen .thumb .tick");
+      const glyph = tick.querySelector("svg").getBoundingClientRect();
+      const box = tick.getBoundingClientRect();
+      const thumb = tick.parentElement.getBoundingClientRect();
+      return { dx: (glyph.left + glyph.right - box.left - box.right) / 2, dy: (glyph.top + glyph.bottom - box.top - box.bottom) / 2,
+        inside: box.left >= thumb.left + 4 && box.top >= thumb.top + 4 };
+    });
+    check(Math.abs(badge.dx) < 0.5 && Math.abs(badge.dy) < 0.5 && badge.inside, "selection check is centred in its badge, badge inside the thumbnail", JSON.stringify(badge));
     await page.click("#select-delete");
     await page.waitForSelector("#modal:not([hidden])");
     await page.waitForTimeout(300);
