@@ -220,7 +220,7 @@ for item in session.aligned_frames():            # 每个深度帧一组
 
 **诊断报告里写着 `IMU crash guard: NOT active`。** 后面会跟原因。最常见的是没装 Xcode 命令行工具，运行一次 `xcode-select --install` 再重跑 `bash run.sh diagnose`。如果写的是 `injected but did not load`，说明这个 Python 不接受注入，把报告发给我。设置环境变量 `D455_NO_HID_GUARD=1` 可以关掉防护，用于对比测试。
 
-**录制停在相机信息那几行不动。** 1.2.6 起，启动 40 秒还没完成时脚本会打印一行 `starting the camera has not finished`，并把各线程当时在做什么写进 `sessions/<session>/derived/start_hang_stacks.txt`，同时给出一条 `sudo sample <进程号> ...` 命令，在另一个终端窗口运行它能拍下 SDK 内部的快照。150 秒时脚本自动退出。之后拔插一次相机再重跑，并把这两个文件发给我。
+**录制停在相机信息那几行不动。** 什么都不用做，等它自己结束。1.2.7 起，启动 40 秒还没完成时，脚本会自动给 SDK 内部拍一张快照（`sessions/<session>/derived/start_hang_sample.txt`，仅 macOS），并把各线程当时在做什么写进同一目录的 `start_hang_stacks.txt`；150 秒时脚本自己退出。这几步都不依赖 Python 主线程，所以 SDK 卡死在底层时也能完成。终端里可能看到一行 `starting the camera has not finished`，也可能什么都没有，两种情况都会留下文件。之后拔插一次相机再重跑，并把这两个文件发给我。
 
 **录制或诊断时打印 `USB hold: NOT active`。** 后面会跟原因。`it needs administrator rights` 说明没有通过 `run.sh` 运行；`macOS did not hand the camera over` 时先退出所有可能用摄像头的程序再试。接管不成功时脚本照常继续，只是彩色可能时有时无。加 `--no-usb-hold` 可以关掉接管，用于对比测试。
 

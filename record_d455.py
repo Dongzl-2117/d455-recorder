@@ -75,7 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 FORMAT_NAME = "realsense-mcap-session"
 FORMAT_VERSION = 1
 HW_CLOCK_WRAP_US = 1 << 32  # the D400 device clock is a 32-bit microsecond counter (~71.6 min)
@@ -459,6 +459,7 @@ START_CHECK_S = 5.0    # every video stream must deliver a first frame this soon
 START_CHECK_TRIES = 3  # starts in one attempt before the recorder gives up and retries from scratch
 START_HANG_S = 40.0    # a start that takes longer is stuck inside the SDK: dump stacks, explain
 START_GIVE_UP_S = 150.0  # then exit, because Ctrl+C cannot reach a thread blocked inside the SDK
+MACOS_SAMPLE_TOOL = "/usr/bin/sample"  # built into macOS: native stacks of a running process
 
 
 @dataclass
@@ -918,19 +919,25 @@ class Recorder:
                 pass
         return result
 
+    def _mark_first_frame(self, frame: Any) -> None:
+        """For start_streams: note which stream this frame belongs to. A subclass that replaces _on_frame calls
+        this while start_streams runs."""
+        seen = self._first_frames
+        if seen is None:
+            return
+        try:
+            profile = frame.get_profile()
+            plan = self.by_key.get((int(profile.stream_type()), int(profile.stream_index())))
+            if plan is not None:
+                seen.add(plan.name)
+        except Exception:
+            pass
+
     def _on_frame(self, frame: Any) -> None:
         receive_ns = time.time_ns()
         monotonic_ns = time.monotonic_ns()
         if not self._accepting:
-            seen = self._first_frames
-            if seen is not None:
-                try:
-                    profile = frame.get_profile()
-                    plan = self.by_key.get((int(profile.stream_type()), int(profile.stream_index())))
-                    if plan is not None:
-                        seen.add(plan.name)
-                except Exception:
-                    pass
+            self._mark_first_frame(frame)
             return
         try:
             profile = frame.get_profile()
@@ -1209,11 +1216,23 @@ class Recorder:
         self._writer_thread = threading.Thread(target=self._write_loop, name="mcap-writer", daemon=True)
         self._writer_thread.start()
 
+        self.start_streams(self.after_start)
+        self._accepting = True
+        self._started_monotonic = time.monotonic()
+        self._started_epoch = time.time()
+        self.manifest["options"] = self.snapshot_options()
+        self.manifest["streams_active"] = [plan.name for plan in self.plans]
+        self._write_manifest("recording")
+
+    def start_streams(self, after_start: Optional[Callable[[], None]] = None) -> None:
+        """Start the sensors of the planned streams (plan_streams first) and wait until every video stream has
+        delivered a frame; restart all of them if one stays silent, up to START_CHECK_TRIES starts. Frames are
+        not recorded here: _on_frame only marks them while _accepting is False (see _mark_first_frame)."""
         self._first_frames = set()
         for attempt in range(1, START_CHECK_TRIES + 1):
             self._start_sensors()
-            if attempt == 1 and self.after_start:
-                self.after_start()
+            if attempt == 1 and after_start:
+                after_start()
             silent = self._wait_for_first_frames(START_CHECK_S)
             if not silent or self.stop_event.is_set():
                 break
@@ -1230,12 +1249,6 @@ class Recorder:
             self._first_frames = set()
             time.sleep(1.0)
         self._first_frames = None
-        self._accepting = True
-        self._started_monotonic = time.monotonic()
-        self._started_epoch = time.time()
-        self.manifest["options"] = self.snapshot_options()
-        self.manifest["streams_active"] = [plan.name for plan in self.plans]
-        self._write_manifest("recording")
 
     def _wait_for_first_frames(self, timeout: float) -> List[str]:
         """Wait until every video stream has delivered a frame (frames are not recorded yet).
@@ -1552,43 +1565,93 @@ class Recorder:
 # --------------------------------------------------------------------------------------------
 class StartWatchdog:
     """Starting the camera normally takes a few seconds (up to ~20 s with restarts). If an SDK call never
-    returns, the main thread is stuck in native code and Ctrl+C cannot reach it. Then write the Python
-    stacks of all threads to a file, tell the user how to take a native snapshot, and finally exit."""
+    returns, the main thread is stuck in native code and Ctrl+C cannot reach it. That thread may also hold
+    the GIL, which would freeze any Python thread too, so the parts that must happen do not need Python:
+    faulthandler's C timer writes the stacks of all threads and ends the process at START_GIVE_UP_S, and on
+    macOS a separate `sample` process takes a native snapshot at START_HANG_S. A Python thread only adds a
+    message at START_HANG_S, when it can run."""
 
     def __init__(self, folder: Path) -> None:
         self.folder = folder
+        self.stacks = folder / "start_hang_stacks.txt"
+        self.sample = folder / "start_hang_sample.txt"
+        self.handle: Any = None
+        self.helper: Any = None
+        self.fired = False
+        self.started = time.monotonic()
         self.done = threading.Event()
+        try:
+            import faulthandler
+            folder.mkdir(parents=True, exist_ok=True)
+            self.handle = self.stacks.open("w")
+            self.handle.write("record_d455.py {}, process id {}: starting the camera took longer than {:.0f} s.\n"
+                              "Below: the stacks of all threads at {:.0f} s, and at {:.0f} s ('Timeout') if the start "
+                              "never finished and this program ended itself.\n"
+                              .format(__version__, os.getpid(), START_HANG_S, START_HANG_S, START_GIVE_UP_S))
+            self.handle.flush()
+            faulthandler.dump_traceback_later(START_GIVE_UP_S, repeat=False, file=self.handle, exit=True)
+        except Exception as error:
+            log("note: the start watchdog's stack dump is unavailable ({})".format(error))
+        sampler = MACOS_SAMPLE_TOOL
+        if sys.platform == "darwin" and os.path.exists(sampler):
+            try:
+                import subprocess
+                self.helper = subprocess.Popen(
+                    ["/bin/sh", "-c", 'sleep "$1"; exec "$2" "$3" 3 -mayDie -file "$4"', "start-watchdog",
+                     str(int(START_HANG_S)), sampler, str(os.getpid()), str(self.sample)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env={key: value for key, value in os.environ.items() if not key.startswith("DYLD_")},
+                    start_new_session=True)
+            except Exception as error:
+                log("note: the start watchdog's native snapshot is unavailable ({})".format(error))
         self.thread = threading.Thread(target=self._watch, name="start-watchdog", daemon=True)
         self.thread.start()
 
     def cancel(self) -> None:
         self.done.set()
+        self.fired = self.fired or time.monotonic() - self.started >= START_HANG_S  # keep what a slow start left
+        try:
+            import faulthandler
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        if self.helper is not None and not self.fired and self.helper.poll() is None:
+            try:
+                os.killpg(self.helper.pid, signal.SIGTERM)  # the shell and its sleep, before sample starts
+                self.helper.wait(timeout=2.0)
+            except Exception:
+                pass
+        if self.handle is not None:
+            try:
+                if self.fired:
+                    self.handle.write("\n--- the start finished after {:.0f} s; the program went on ---\n"
+                                      .format(time.monotonic() - self.started))
+                self.handle.close()
+                if not self.fired:
+                    self.stacks.unlink()
+            except Exception:
+                pass
 
     def _watch(self) -> None:
         if self.done.wait(START_HANG_S):
             return
-        path = self.folder / "start_hang_stacks.txt"
+        self.fired = True
         try:
             import faulthandler
-            self.folder.mkdir(parents=True, exist_ok=True)
-            with path.open("w") as handle:
-                faulthandler.dump_traceback(file=handle, all_threads=True)
-            hand_back_ownership(path, recursive=False)
-        except Exception as error:
-            path = Path("(could not write stacks: {})".format(error))
-        warn("starting the camera has not finished after {:.0f} s; the SDK is stuck inside a call (process id {}). "
-             "Python stacks: {}".format(START_HANG_S, os.getpid(), path))
-        if sys.platform == "darwin":
-            log("  For a native snapshot, run in another Terminal window:\n"
-                "    sudo sample {} 3 -file \"{}\"".format(os.getpid(), self.folder / "start_hang_sample.txt"))
-        log("  This program exits by itself in {:.0f} s. Then unplug the camera for 10 s and plug it back in."
+            self.handle.write("\n--- at {:.0f} s (the start was still running) ---\n".format(START_HANG_S))
+            self.handle.flush()
+            faulthandler.dump_traceback(file=self.handle, all_threads=True)
+            self.handle.write("\n--- at {:.0f} s, if this program ended itself ---\n".format(START_GIVE_UP_S))
+            self.handle.flush()
+        except Exception:
+            pass
+        warn("starting the camera has not finished after {:.0f} s; the SDK is stuck inside a call (process id {})."
+             .format(START_HANG_S, os.getpid()))
+        log("  What each thread is doing is saved to {}".format(self.stacks))
+        if self.helper is not None:
+            log("  A native snapshot is being saved to {}".format(self.sample))
+        log("  This program ends itself in {:.0f} s. Then unplug the camera for 10 s and plug it back in."
             .format(START_GIVE_UP_S - START_HANG_S))
-        if self.done.wait(START_GIVE_UP_S - START_HANG_S):
-            return
-        log("Giving up: the SDK never returned. Unplug the camera for 10 s, plug it back in, and run again.")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(3)
 
 
 def is_finalized(path: Path) -> bool:
