@@ -220,6 +220,8 @@ for item in session.aligned_frames():            # 每个深度帧一组
 
 **诊断报告里写着 `IMU crash guard: NOT active`。** 后面会跟原因。最常见的是没装 Xcode 命令行工具，运行一次 `xcode-select --install` 再重跑 `bash run.sh diagnose`。如果写的是 `injected but did not load`，说明这个 Python 不接受注入，把报告发给我。设置环境变量 `D455_NO_HID_GUARD=1` 可以关掉防护，用于对比测试。
 
+**录制停在相机信息那几行不动。** 1.2.6 起，启动 40 秒还没完成时脚本会打印一行 `starting the camera has not finished`，并把各线程当时在做什么写进 `sessions/<session>/derived/start_hang_stacks.txt`，同时给出一条 `sudo sample <进程号> ...` 命令，在另一个终端窗口运行它能拍下 SDK 内部的快照。150 秒时脚本自动退出。之后拔插一次相机再重跑，并把这两个文件发给我。
+
 **录制或诊断时打印 `USB hold: NOT active`。** 后面会跟原因。`it needs administrator rights` 说明没有通过 `run.sh` 运行；`macOS did not hand the camera over` 时先退出所有可能用摄像头的程序再试。接管不成功时脚本照常继续，只是彩色可能时有时无。加 `--no-usb-hold` 可以关掉接管，用于对比测试。
 
 **Mac 上的 `selftest` 为什么不用 SDK 的模拟相机。** 社区版 SDK 2.56.5 在模拟相机注入帧时会在内部崩溃，和这台 Mac 的设置无关。Mac 上自测改用 Python 生成的帧，录制、编码、写盘、读回、对齐分析用的是和真机录制同一套代码，只是帧不经过 SDK。Windows 和 Linux 上仍用 SDK 的模拟相机，`selftest --engine python` 或 `--engine sdk` 可以手动指定。

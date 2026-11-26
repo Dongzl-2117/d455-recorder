@@ -75,7 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 FORMAT_NAME = "realsense-mcap-session"
 FORMAT_VERSION = 1
 HW_CLOCK_WRAP_US = 1 << 32  # the D400 device clock is a 32-bit microsecond counter (~71.6 min)
@@ -457,6 +457,8 @@ class McapSink:
 # --------------------------------------------------------------------------------------------
 START_CHECK_S = 5.0    # every video stream must deliver a first frame this soon after starting
 START_CHECK_TRIES = 3  # starts in one attempt before the recorder gives up and retries from scratch
+START_HANG_S = 40.0    # a start that takes longer is stuck inside the SDK: dump stacks, explain
+START_GIVE_UP_S = 150.0  # then exit, because Ctrl+C cannot reach a thread blocked inside the SDK
 
 
 @dataclass
@@ -1366,7 +1368,11 @@ class Recorder:
         """Start, record until a stop condition, finalize. Returns the verify report."""
         reason = "user"
         try:
-            self.start()
+            watchdog = StartWatchdog(self.session_dir / "derived")
+            try:
+                self.start()
+            finally:
+                watchdog.cancel()
             log("Recording to {}".format(self.session_dir.resolve()))
             log("Streams: " + ", ".join(
                 "{} {}x{}@{} {}".format(plan.name, plan.width, plan.height, plan.fps, plan.fmt)
@@ -1544,6 +1550,47 @@ class Recorder:
 # --------------------------------------------------------------------------------------------
 # Reading sessions back
 # --------------------------------------------------------------------------------------------
+class StartWatchdog:
+    """Starting the camera normally takes a few seconds (up to ~20 s with restarts). If an SDK call never
+    returns, the main thread is stuck in native code and Ctrl+C cannot reach it. Then write the Python
+    stacks of all threads to a file, tell the user how to take a native snapshot, and finally exit."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._watch, name="start-watchdog", daemon=True)
+        self.thread.start()
+
+    def cancel(self) -> None:
+        self.done.set()
+
+    def _watch(self) -> None:
+        if self.done.wait(START_HANG_S):
+            return
+        path = self.folder / "start_hang_stacks.txt"
+        try:
+            import faulthandler
+            self.folder.mkdir(parents=True, exist_ok=True)
+            with path.open("w") as handle:
+                faulthandler.dump_traceback(file=handle, all_threads=True)
+            hand_back_ownership(path, recursive=False)
+        except Exception as error:
+            path = Path("(could not write stacks: {})".format(error))
+        warn("starting the camera has not finished after {:.0f} s; the SDK is stuck inside a call (process id {}). "
+             "Python stacks: {}".format(START_HANG_S, os.getpid(), path))
+        if sys.platform == "darwin":
+            log("  For a native snapshot, run in another Terminal window:\n"
+                "    sudo sample {} 3 -file \"{}\"".format(os.getpid(), self.folder / "start_hang_sample.txt"))
+        log("  This program exits by itself in {:.0f} s. Then unplug the camera for 10 s and plug it back in."
+            .format(START_GIVE_UP_S - START_HANG_S))
+        if self.done.wait(START_GIVE_UP_S - START_HANG_S):
+            return
+        log("Giving up: the SDK never returned. Unplug the camera for 10 s, plug it back in, and run again.")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(3)
+
+
 def is_finalized(path: Path) -> bool:
     """True if the MCAP file has its footer and chunk index (the recorder closed it normally)."""
     from mcap.reader import make_reader
@@ -3216,7 +3263,8 @@ def wait_for_device(rs: Any, context: Any, serial: str, stop_event: threading.Ev
                 time.sleep(1.5)  # let a freshly plugged camera finish enumerating all its interfaces
                 found = find_device(rs, context, serial, quiet=True) or found
             return found
-        if not announced:
+        settling = ready is False and gate.since is not None  # listed by macOS, just not steady for long yet
+        if not announced and not settling:
             log("Waiting for a RealSense D455{}... plug it into a USB 3 port.".format(
                 " with serial " + serial if serial else ""))
             announced = True
@@ -3306,6 +3354,18 @@ def command_record(args: argparse.Namespace) -> int:
     context = None
     if not args.simulate:
         require_admin_on_macos(args)
+        if sys.platform == "darwin":
+            log("process id {} (for troubleshooting)".format(os.getpid()))
+        if getattr(args, "sdk_log", False):
+            folder = Path(os.path.abspath(__file__)).resolve().parent / "logs"
+            folder.mkdir(parents=True, exist_ok=True)
+            sdk_log = folder / "record_{}_sdk.log".format(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+            try:
+                rs.log_to_file(rs.log_severity.debug, str(sdk_log))
+                hand_back_ownership(folder, recursive=False)
+                log("SDK debug log: {}".format(sdk_log))
+            except Exception as error:
+                log("could not enable the SDK log: {}".format(error))
         start_macos_usb_hold(args)
         if wait_for_macos_usb(stop_event):
             take_macos_camera(stop_event)
@@ -4164,6 +4224,8 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--no-sudo", action="store_true",
                             help="macOS: do not re-run through sudo (the SDK usually cannot open the camera then)")
         target.add_argument("--no-usb-hold", action="store_true", help=NO_USB_HOLD_HELP)
+        target.add_argument("--sdk-log", action="store_true",
+                            help="write the SDK's debug log to logs/record_<time>_sdk.log (for troubleshooting)")
         target.add_argument("--quiet", action="store_true", help="no live status line")
 
     add_record_arguments(parser)
