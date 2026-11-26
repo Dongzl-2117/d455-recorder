@@ -153,7 +153,8 @@ export UV_CACHE_DIR="${WORK}/cache" UV_PYTHON_INSTALL_DIR="${PYROOT}" UV_PYTHON_
 
 say "2/5 安装服务专用的 Python ${PYTHON_VERSION}（下载约 25 MB，装好约 70 MB，在 ${PYROOT}）..."
 mkdir -p "${HOME_DIR}"
-"${UV}" python install "${PYTHON_VERSION}" >/dev/null || die "下载 Python 失败，请检查网络（需要能访问 github.com）。"
+"${UV}" python install "${PYTHON_VERSION}" >"${WORK}/uv-python.log" 2>&1 \
+  || { cat "${WORK}/uv-python.log"; die "下载 Python 失败，请检查网络（需要能访问 github.com）。"; }
 BASE_PY="$("${UV}" python find "${PYTHON_VERSION}")" || die "装好的 Python 找不到。"
 case "${BASE_PY}" in "${PYROOT}"/*) ;; *) die "找到的 Python 不在 ${PYROOT}：${BASE_PY}" ;; esac
 
