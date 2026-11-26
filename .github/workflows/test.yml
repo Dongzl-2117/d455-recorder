@@ -38,6 +38,8 @@ jobs:
       - name: Studio self check (no camera here, so warnings are expected)
         run: python d455_studio.py --doctor --sessions ci-sessions
         continue-on-error: true
+      - name: Repair keeps the original on errors
+        run: python tests/test_repair.py
       - name: Studio end to end
         run: python tests/test_studio.py
       - name: Root safety (links, foreign folders and imports under the root service)

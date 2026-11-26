@@ -286,7 +286,7 @@ for item in session.aligned_frames():            # 每个深度帧一组
 
 **报告里时间戳域是 `system_time`，结果为 FAIL。** 说明逐帧元数据没有到达 SDK，时间戳退化成了电脑收到数据的时刻，精度只有 USB 抖动水平。Mac 和 Linux 上一般不会出现；Windows 上需要以管理员身份运行一次 `python record_d455.py enable-metadata`，然后重新插拔相机。
 
-**录制中途程序崩溃或电脑断电。** 数据边录边写盘，程序崩溃最多丢最后约 1 秒，断电最多丢最后几秒。下次运行时脚本会提示有未关闭的 session，运行 `bash run.sh repair sessions/<session>` 修复索引并补全报告。
+**录制中途程序崩溃或电脑断电。** 数据边录边写盘，程序崩溃最多丢最后约 1 秒，断电最多丢最后几秒。下次运行时脚本会提示有未关闭的 session，运行 `bash run.sh repair sessions/<session>` 修复索引并补全报告。修复要先写一份和原文件差不多大的副本，所以需要那么多剩余空间（10 分钟一段约 9 GB）；空间不够、或者读写出错时，修复会停下并说明原因，原文件保持不动，可以腾出空间后再修。
 
 **合上笔记本盖子。** 脚本会阻止系统空闲休眠，但合盖仍会休眠并中断录制。长时间录制请保持开盖并接电源。
 
@@ -313,5 +313,5 @@ for item in session.aligned_frames():            # 每个深度帧一组
 | `d455_studio.py` + `studio/` | 网页界面：本机网页服务（只用 Python 标准库）和页面 |
 | `studio.sh` / `studio.bat` | 启动网页界面 |
 | `install_service.sh` | macOS：把网页界面装成按需启动的后台服务，以后录制不用输密码；`doctor` 排查问题 |
-| `tests/` | 不需要相机的自动测试：`python tests/test_studio.py`（接口和按需启动），`node tests/test_page.js`（浏览器里的网页），`sudo python tests/test_root_safety.py`（服务以管理员身份运行时不跟随替身、不写进别人的文件夹） |
+| `tests/` | 不需要相机的自动测试：`python tests/test_studio.py`（接口和按需启动），`node tests/test_page.js`（浏览器里的网页），`sudo python tests/test_root_safety.py`（服务以管理员身份运行时不跟随替身、不写进别人的文件夹），`python tests/test_repair.py`（修复遇到读写错误或空间不够时原文件不动） |
 | `.github/workflows/test.yml` | 每次推送在 Ubuntu、Windows、macOS 上跑上面的测试，并在一台干净的 Mac 上安装、使用、卸载后台服务 |
