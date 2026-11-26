@@ -75,7 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 FORMAT_NAME = "realsense-mcap-session"
 FORMAT_VERSION = 1
 HW_CLOCK_WRAP_US = 1 << 32  # the D400 device clock is a 32-bit microsecond counter (~71.6 min)
@@ -824,16 +824,16 @@ class Recorder:
                 self.note("warning", "--set {}: option not supported by this sensor".format(override))
 
     def snapshot_options(self) -> Dict[str, Dict[str, float]]:
+        """Current option values of each sensor, taken while it streams. Never through
+        sensor.get_supported_options(): see all_options()."""
         snapshot: Dict[str, Dict[str, float]] = {}
+        candidates = all_options(self.rs)
         for role, sensor in self.sensor_roles.items():
             values: Dict[str, float] = {}
-            try:
-                options = list(sensor.get_supported_options())
-            except Exception:
-                options = []
-            for option in options:
+            for option in candidates:
                 try:
-                    values[getattr(option, "name", str(option))] = float(sensor.get_option(option))
+                    if sensor.supports(option):
+                        values[getattr(option, "name", str(option))] = float(sensor.get_option(option))
                 except Exception:
                     pass
             snapshot[role] = values
@@ -1563,6 +1563,23 @@ class Recorder:
 # --------------------------------------------------------------------------------------------
 # Reading sessions back
 # --------------------------------------------------------------------------------------------
+def all_options(rs: Any) -> List[Any]:
+    """Every option the SDK knows, to be filtered with sensor.supports(option).
+
+    Do not call sensor.get_supported_options(). In librealsense 2.56.5 its C function (rs2_get_options_list)
+    takes the sensor's USB power reference once and gives it back twice when built with libc++ (macOS):
+    rsutils::deferred is moved with a defaulted move, and libc++ leaves a small std::function in the moved-from
+    object, so both copies run. On a streaming sensor the count reaches 0 and the SDK powers the camera
+    interface down while frames flow; closing the stream waits for the frame callbacks, and a Python callback
+    waits for the GIL held by the caller: a deadlock (seen on the Mac, 1.2.7 start watchdog snapshot).
+    Upstream master moves it explicitly. supports(), get_option() and set_option() keep the count balanced."""
+    members = getattr(rs.option, "__members__", None)
+    if members:
+        return list(members.values())
+    return [value for name, value in vars(rs.option).items()
+            if not name.startswith("_") and isinstance(value, rs.option)]
+
+
 class StartWatchdog:
     """Starting the camera normally takes a few seconds (up to ~20 s with restarts). If an SDK call never
     returns, the main thread is stuck in native code and Ctrl+C cannot reach it. That thread may also hold
@@ -2465,6 +2482,10 @@ class _MockSensor:
         return list(self.profiles)
 
     def get_supported_options(self) -> List[Any]:
+        # Like pyrealsense2 2.56.5 on macOS (see all_options): on a streaming sensor this powers it down, so
+        # frames stop. The self-test then fails if the recorder ever calls it again.
+        with self.lock:
+            self.callback = None
         return [self.rs.option(value) for value in self.options]
 
     def set_option(self, option: Any, value: float) -> None:
