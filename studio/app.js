@@ -28,6 +28,12 @@ const ICONS = {
   camera: '<rect x="3" y="7" width="18" height="12" rx="3"/><circle cx="8.5" cy="13" r="2.4"/><circle cx="15.5" cy="13" r="2.4"/><path d="M8 7l1-2h6l1 2"/>',
   alert: '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/>',
   plug: '<path d="M9 3v5M15 3v5M7 8h10v3a5 5 0 0 1-10 0zM12 16v5"/>',
+  trash: '<path d="M4.5 7h15M10 4h4M6.5 7l.8 11.2a2 2 0 0 0 2 1.8h5.4a2 2 0 0 0 2-1.8L17.5 7M10 11v5M14 11v5"/>',
+  upload: '<path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 14v3.5A2.5 2.5 0 0 0 7.5 20h9a2.5 2.5 0 0 0 2.5-2.5V14"/>',
+  check: '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8.5 12.2l2.4 2.4 4.8-5"/>',
+  power: '<path d="M12 3.5v8M7.2 6.4a7.5 7.5 0 1 0 9.6 0"/>',
+  chevron: '<path d="M14.5 5.5 8 12l6.5 6.5"/>',
+  ok: '<circle cx="12" cy="12" r="8.5"/><path d="M8.3 12.3l2.5 2.5 4.9-5.1"/>',
 };
 function icon(name, extra = "") {
   const body = ICONS[name] || "";
@@ -391,7 +397,7 @@ const live = {
     if (changed && this.running) { this.stop(); this.start(); }
   },
   start() {
-    if (this.running) return;
+    if (this.running || app.closed) return;
     this.running = true;
     const generation = ++this.generation;
     for (const name of this.streams) this.loop(name, generation);
@@ -436,9 +442,13 @@ live.stage.onProbe = (panel, x, y) => live.probe(panel, x, y);
 // ---------------------------------------------------------------------------------------------
 // state polling and the live controls
 // ---------------------------------------------------------------------------------------------
-const app = { state: null, eventId: -1, failures: 0, lastResultKey: null, recordClickAt: 0, tab: "live" };
+const app = { state: null, eventId: -1, failures: 0, lastResultKey: null, recordClickAt: 0, tab: "live", polling: false, closed: false };
 
+// No requests at all while the tab is hidden or closed: the macOS service exits after a few minutes without
+// requests and launchd starts it again on the next one, so a forgotten background tab costs nothing.
 async function poll() {
+  if (app.closed || document.hidden) { app.polling = false; return; }
+  app.polling = true;
   try {
     const since = app.eventId < 0 ? 0 : app.eventId;
     // want=1 keeps the camera streaming (the server pauses it when nobody has looked for a minute)
@@ -450,14 +460,66 @@ async function poll() {
     app.failures++;
     if (app.failures >= 3) onOffline();
   }
-  setTimeout(poll, document.hidden ? 2000 : 500);
+  setTimeout(poll, 500);
 }
+function resumePolling() { if (!app.polling && !app.closed && !document.hidden) poll(); }
 
 function onOffline() {
   setDevice("bad", "连接不到 D455 Studio");
   live.stage.setOverlay(`<div class="notice"><div class="glyph">${icon("plug")}</div><div class="big">连接不到 D455 Studio</div>
-    <p>后台程序没有响应。如果你是用 studio.sh 在终端里启动的，它可能已经退出，重新运行一次即可；如果装成了开机服务，它会在几秒内自动重启。</p></div>`);
+    <p>程序没有响应。Mac 上装成后台服务的，打开这个网页时会自动启动，等十几秒再刷新；还不行就在终端运行 <code>bash install_service.sh doctor</code>，它会写明原因。用 studio.sh 或 studio.bat 在终端里启动的，它可能已经退出，重新运行一次即可。</p></div>`);
   $("#rec-btn").disabled = true;
+}
+
+function showClosed(service) {
+  app.closed = true;
+  live.stop();
+  player.pause();
+  $("#closed-glyph").innerHTML = icon("power");
+  $("#closed-title").textContent = service ? "后台服务已关闭" : "D455 Studio 已退出";
+  $("#closed-text").textContent = service
+    ? "相机已经交还给系统，CPU 和内存也都释放了。再打开或刷新这个网页时会自动启动，不需要密码。"
+    : "相机已经释放。要再用，在终端重新运行 studio.sh（Windows：studio.bat）。";
+  $("#closed-reopen").hidden = !service;
+  $("#closed").hidden = false;
+}
+$("#closed-reopen").onclick = () => location.reload();
+
+async function quitService() {
+  const service = !!(app.state && app.state.camera.service);
+  if (!service && !(await confirmDialog({ title: "退出 D455 Studio？", html: "<p>退出后要在终端重新运行 studio.sh 才能再用。</p>", confirm: "退出" }))) return;
+  try { await api.post("/api/service/quit"); showClosed(service); } catch (error) { reportError(error); }
+}
+
+// A small modal. buttons: [{label, value, kind, run}], the first one is the safe choice and gets the focus
+// (a stray Enter must never confirm a deletion); Escape and a click outside resolve null. run() is called
+// inside the click itself, which a file picker needs.
+function choiceDialog({ title, html = "", buttons }) {
+  return new Promise((resolve) => {
+    const modal = $("#modal");
+    $("#modal-title").textContent = title;
+    $("#modal-body").innerHTML = html;
+    const actions = $("#modal-actions");
+    actions.innerHTML = "";
+    const finish = (value) => { modal.hidden = true; document.removeEventListener("keydown", onKey, true); resolve(value); };
+    const onKey = (event) => { if (event.key === "Escape") { event.stopPropagation(); finish(null); } };
+    const elements = buttons.map((spec) => {
+      const button = document.createElement("button");
+      button.className = "btn " + (spec.kind || "");
+      button.textContent = spec.label;
+      button.onclick = () => { if (spec.run) spec.run(); finish(spec.value); };
+      return button;
+    });
+    actions.append(...elements);
+    modal.onclick = (event) => { if (event.target === modal) finish(null); };
+    document.addEventListener("keydown", onKey, true);
+    modal.hidden = false;
+    elements[0].focus();
+  });
+}
+async function confirmDialog({ title, html = "", confirm = "确定", cancel = "取消", danger = false }) {
+  return (await choiceDialog({ title, html, buttons: [{ label: cancel, value: false },
+    { label: confirm, value: true, kind: danger ? "danger" : "primary" }] })) === true;
 }
 
 function setDevice(level, text, sub = "") {
@@ -504,7 +566,7 @@ function onState(state) {
   const fresh = app.eventId < 0 ? [] : state.events;
   app.eventId = state.event_id;
   for (const event of fresh) {
-    if (event.source === "studio" && event.level !== "info") toast(event.message, { level: event.level, timeout: 8000 });
+    if (event.source === "studio" && event.level !== "info") toast(event.message, { level: event.level, sub: event.hint || "", timeout: event.hint ? 15000 : 8000 });
   }
   settings.renderLog(state.events, previous == null);
 
@@ -527,20 +589,58 @@ function liveOverlay(camera) {
   if (camera.state === "waiting") {
     html = `<div class="notice"><div class="glyph">${icon("camera")}</div><div class="big">等待相机接入</div>
       <p>用 USB 3 数据线把 D455 直接插到这台电脑上，几秒后会自动连接。</p>
-      <ul><li>线要标 5 Gbps 或更高，很多充电线只有 USB 2</li><li>D455 的 USB-C 口比外壳深，插头要推到底</li><li>不要经过扩展坞或 Hub</li></ul></div>`;
+      <ul><li>线要标 5 Gbps 或更高，很多充电线只有 USB 2</li><li>D455 的 USB-C 口比外壳深，插头要推到底</li><li>不要经过扩展坞或 Hub</li></ul>
+      <div class="hints checks"></div></div>`;
   } else if (camera.state === "idle") {
     html = `<div class="notice"><span class="spinner"></span><div class="big">正在唤醒相机</div>
       <p>一分钟没人看时相机会暂停出图（投射器也关掉），回到这一页几秒后自动恢复。</p></div>`;
   } else if (camera.state === "error") {
     html = `<div class="notice"><div class="glyph">${icon("alert")}</div><div class="big">相机出错</div><p>${esc(camera.message)}</p>
-      <button class="btn" onclick="restartCamera()">重新打开相机</button></div>`;
+      <button class="btn" onclick="restartCamera()">重新打开相机</button><div class="hints checks"></div></div>`;
   } else {
     html = `<div class="notice"><span class="spinner"></span><div class="big">${esc(camera.message || "正在打开相机")}</div>
       <p>第一次接管相机时彩色可能要重启一次数据流，属于正常。</p></div>`;
   }
   stage.setOverlay(html);
   for (const panel of stage.panels.values()) if (panel.bitmap) panel.clear("");
+  // still no camera after a few seconds: ask the server what the system sees, and keep that up to date
+  const stuck = camera.state === "waiting" || camera.state === "error";
+  const now = performance.now();
+  if (!stuck) { app.stuckSince = 0; return; }
+  if (!app.stuckSince) { app.stuckSince = now; app.hintAt = 0; }
+  if (app.tab === "live" && now - app.stuckSince > 5000 && now - (app.hintAt || 0) > 10000) { app.hintAt = now; doctor.overlayHints(); }
 }
+
+const doctor = {
+  findings: null,
+  loading: null,
+  at: 0,
+  load(fresh) {
+    if (this.loading) return this.loading;
+    if (!fresh && this.findings && performance.now() - this.at < 6000) { this.render(); return Promise.resolve(this.findings); }
+    if (!this.findings) $("#doctor").innerHTML = '<p class="note">正在检查…</p>';
+    this.loading = api.get("/api/diagnostics" + (fresh ? "?fresh=1" : "")).then((data) => {
+      this.findings = data.findings; this.at = performance.now(); this.render(); return this.findings;
+    }).catch((error) => { $("#doctor").innerHTML = `<p class="note">${esc(error.message)}</p>`; return null; })
+      .finally(() => { this.loading = null; });
+    return this.loading;
+  },
+  html(items) {
+    return items.map((item) => `<div class="check ${item.level}"><span class="mark"></span><div class="what">${esc(item.title)}</div>
+      ${item.detail && item.level !== "ok" ? `<div class="why">${esc(item.detail)}</div>` : ""}
+      ${item.fix && item.level !== "ok" ? `<div class="fix">办法：${esc(item.fix)}</div>` : ""}</div>`).join("");
+  },
+  render() { if (this.findings) $("#doctor").innerHTML = this.html(this.findings) || '<p class="note">没有可检查的项目</p>'; },
+  // Under the "waiting for the camera" notice: what the system itself sees, refreshed while the notice stays up.
+  async overlayHints() {
+    const findings = await this.load(true);
+    const holder = $("#live-stage .notice .hints");
+    if (!holder || !findings) return;
+    const relevant = findings.filter((item) => (item.level === "bad" || item.level === "warn") && ["usb", "camera", "guard", "usb_sdk", "hang"].includes(item.key));
+    holder.innerHTML = this.html(relevant);
+  },
+};
+$("#doctor-run").onclick = () => doctor.load(true);
 
 async function restartCamera() {
   try { await api.post("/api/camera/restart"); toast("正在重新打开相机"); } catch (error) { reportError(error); }
@@ -657,6 +757,7 @@ const settings = {
     this.loadOptions();
     this.loadProfiles();
     this.syncForms(true);
+    doctor.load(false);
     if (section === "display") setTimeout(() => $("#cmap").scrollIntoView({ block: "center", behavior: "smooth" }), 250);
   },
   async loadOptions() {
@@ -788,6 +889,11 @@ const settings = {
     $("#camera-kv").innerHTML = rows.map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join("");
     $("#service-restart").hidden = !camera.service;
     $("#camera-reset").disabled = camera.state !== "streaming" || !!app.state.recording;
+    $("#service-quit").innerHTML = icon("power") + (camera.service ? "关闭后台服务" : "退出程序");
+    $("#service-quit").disabled = !!app.state.recording;
+    $("#service-note").textContent = camera.service
+      ? (app.state.exit_after ? `后台服务按需运行：打开这个网页时自动启动，网页关掉 ${Math.round(app.state.exit_after / 60)} 分钟后（没有在录制）自动退出，退出后不占 CPU 和内存，相机交还系统。` : "")
+      : "这个程序是在终端里启动的，关掉终端窗口或按 Ctrl+C 也会退出。";
   },
   renderLog(events, reset) {
     if (reset) this.log = [];
@@ -828,8 +934,9 @@ $("#camera-restart").onclick = restartCamera;
 $("#camera-reset").onclick = async () => {
   try { await api.post("/api/camera/reset"); toast("已发硬件复位，相机约 10 秒后重新连上"); } catch (error) { reportError(error); }
 };
+$("#service-quit").onclick = quitService;
 $("#service-restart").onclick = async () => {
-  try { await api.post("/api/service/restart"); toast("后台服务正在重启，约 15 秒后自动恢复", { timeout: 15000 }); } catch (error) { reportError(error); }
+  try { await api.post("/api/service/restart"); toast("后台服务正在重启，几秒后自动恢复", { timeout: 15000 }); } catch (error) { reportError(error); }
 };
 display.listeners.push(() => {
   for (const stage of [live.stage, player.stage]) for (const panel of stage.panels.values()) panel.updateLegend();
@@ -866,7 +973,10 @@ function setTab(name) {
 }
 $$(".tabs button").forEach((button) => button.onclick = () => setTab(button.dataset.tab));
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) live.stop(); else if (app.tab === "live") live.start();
+  if (document.hidden) { live.stop(); return; }
+  if (app.closed) return;
+  resumePolling();
+  if (app.tab === "live") live.start();
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -885,22 +995,35 @@ const library = {
   items: [],
   root: "",
   selected: null,
+  selecting: false,
+  chosen: new Set(),
   async refresh() {
     try {
       const data = await api.get("/api/sessions");
       this.items = data.sessions;
       this.root = data.root;
+      for (const id of this.chosen) if (!this.item(id)) this.chosen.delete(id);
       this.render();
     } catch (error) { reportError(error, "读取录制列表失败："); }
   },
-  render() {
+  visible() {
     const query = $("#search").value.trim().toLowerCase();
-    const items = this.items.filter((item) => !query || [item.id, item.scene.location, item.scene.notes, item.scene.activity, item.device.serial]
+    return this.items.filter((item) => !query || [item.id, item.scene.location, item.scene.notes, item.scene.activity, item.device.serial]
       .some((text) => (text || "").toLowerCase().includes(query)));
+  },
+  render() {
+    const items = this.visible();
     $("#session-count").textContent = this.items.length ? String(this.items.length) : "";
+    $("#list-title").hidden = this.selecting;
+    $("#select-title").hidden = !this.selecting;
+    $("#select-bar").hidden = !this.selecting;
+    $("#view-library").classList.toggle("selecting", this.selecting);
+    this.renderSelection();
     const list = $("#session-list");
     if (!items.length) {
-      list.innerHTML = `<div class="empty-list">${this.items.length ? "没有匹配的录制" : "还没有录制。<br>去「实时」页点红色按钮开始第一次录制。"}</div>`;
+      list.innerHTML = `<div class="empty-list">${this.items.length ? "没有匹配的录制" : `还没有录制。<br>去「实时」页点红色按钮录一段，<br>或者把别处拷来的录像文件夹、.mcap 文件拖到这里。<br><button class="btn small" id="empty-import">${icon("upload")}导入录像</button>`}</div>`;
+      const button = $("#empty-import");
+      if (button) button.onclick = () => importer.choose();
       return;
     }
     let html = "", lastDay = "";
@@ -911,14 +1034,18 @@ const library = {
       const [kind, text] = sessionTag(item);
       const tag = `<span class="tag ${kind}">${esc(text)}</span>`;
       const scene = [item.scene.location, item.scene.notes].filter(Boolean).join(" · ");
-      const line2 = scene || [fmtBytes(item.bytes), item.device.serial].filter(Boolean).join(" · ");
-      html += `<button class="card ${item.id === this.selected ? "active" : ""}" data-id="${esc(item.id)}" title="${esc(item.id)}">
-        <div class="thumb" data-src="/api/sessions/${encodeURIComponent(item.id)}/thumb">${item.duration_s != null ? `<span class="dur">${fmtDuration(item.duration_s)}</span>` : ""}</div>
+      const origin = [item.folder ? `${item.folder}/` : "", item.kind === "file" ? item.name : ""].join("");
+      const facts = [fmtBytes(item.bytes), item.device.serial].filter(Boolean).join(" · ");
+      const line2 = scene || origin || facts;
+      const line3 = line2 === facts ? (scene ? "" : origin && origin !== line2 ? origin : "") : facts;
+      const chosen = this.chosen.has(item.id);
+      html += `<button class="card ${item.id === this.selected && !this.selecting ? "active" : ""} ${chosen ? "chosen" : ""} ${item.live ? "is-live" : ""}" data-id="${esc(item.id)}" title="${esc(item.id)}">
+        <div class="thumb" data-src="/api/sessions/${encodeURIComponent(item.id)}/thumb">${item.duration_s != null ? `<span class="dur">${fmtDuration(item.duration_s)}</span>` : ""}<span class="tick">${icon("ok")}</span></div>
         <div class="meta"><div class="line1"><span class="time">${timeOf(date)}</span>${tag}</div><div class="line2">${esc(line2)}</div>
-        <div class="line2">${esc(scene ? fmtBytes(item.bytes) + (item.device.serial ? " · " + item.device.serial : "") : "")}</div></div></button>`;
+        <div class="line2">${esc(line3)}</div></div></button>`;
     }
     list.innerHTML = html;
-    $$(".card", list).forEach((card) => card.onclick = () => this.open(card.dataset.id));
+    $$(".card", list).forEach((card) => card.onclick = () => this.selecting ? this.toggle(card.dataset.id) : this.open(card.dataset.id));
     $$(".thumb", list).forEach((thumb) => thumbObserver.observe(thumb));
   },
   item(id) { return this.items.find((item) => item.id === id); },
@@ -930,11 +1057,248 @@ const library = {
     if (item && item.live) { toast("这个 session 正在录制，停止后才能回放", { level: "warning" }); return; }
     await player.open(id, item);
   },
+  // ---- selecting and deleting
+  setSelecting(on) {
+    this.selecting = on;
+    if (!on) this.chosen.clear();
+    this.render();
+  },
+  toggle(id) {
+    const item = this.item(id);
+    if (!item) return;
+    if (item.live) { toast("正在录制的不能删除", { level: "warning" }); return; }
+    if (this.chosen.has(id)) this.chosen.delete(id); else this.chosen.add(id);
+    const card = $(`.card[data-id="${CSS.escape(id)}"]`);
+    if (card) card.classList.toggle("chosen", this.chosen.has(id));
+    this.renderSelection();
+  },
+  renderSelection() {
+    const chosen = [...this.chosen].map((id) => this.item(id)).filter(Boolean);
+    const bytes = chosen.reduce((sum, item) => sum + (item.bytes || 0), 0);
+    $("#select-count").textContent = chosen.length ? `已选 ${chosen.length} 个` : "点选要删除的录制";
+    $("#select-size").textContent = chosen.length ? `共 ${fmtBytes(bytes)}` : "";
+    $("#select-delete").disabled = !chosen.length;
+    const all = this.visible().filter((item) => !item.live);
+    $("#select-all").textContent = all.length && all.every((item) => this.chosen.has(item.id)) ? "全不选" : "全选";
+  },
+  selectAll() {
+    const all = this.visible().filter((item) => !item.live);
+    const every = all.every((item) => this.chosen.has(item.id));
+    for (const item of all) { if (every) this.chosen.delete(item.id); else this.chosen.add(item.id); }
+    this.render();
+  },
+  async remove(ids) {
+    const items = ids.map((id) => this.item(id)).filter(Boolean);
+    if (!items.length) return;
+    const bytes = items.reduce((sum, item) => sum + (item.bytes || 0), 0);
+    const names = items.slice(0, 6).map((item) => {
+      const date = parseDate(item.created);
+      const label = [date ? `${dayLabel(date)} ${timeOf(date)}` : item.id, [item.scene.location, item.scene.notes].filter(Boolean).join(" · ")].filter(Boolean).join("　");
+      return `<li><span>${esc(label)}</span><span class="muted">${esc(fmtBytes(item.bytes))}</span></li>`;
+    }).join("") + (items.length > 6 ? `<li class="muted">还有 ${items.length - 6} 个</li>` : "");
+    const ok = await confirmDialog({
+      title: items.length === 1 ? "删除这个录制？" : `删除 ${items.length} 个录制？`,
+      html: `<ul class="list-names">${names}</ul><p>共 ${esc(fmtBytes(bytes))}。会从磁盘上直接删除，<b>不经过废纸篓，不能恢复</b>。</p>`,
+      confirm: "删除", danger: true,
+    });
+    if (!ok) return;
+    let result;
+    try { result = await api.post("/api/sessions/delete", { ids: items.map((item) => item.id) }); } catch (error) { reportError(error, "删除失败："); return; }
+    if (result.deleted.length) toast(`已删除 ${result.deleted.length} 个录制，空出 ${fmtBytes(result.freed)}`);
+    for (const failure of result.failed) toast(`没有删除 ${failure.id}`, { level: "error", sub: failure.error, timeout: 10000 });
+    if (result.deleted.includes(player.id)) player.close();
+    for (const id of result.deleted) this.chosen.delete(id);
+    if (this.selecting && !this.chosen.size) this.selecting = false;
+    await this.refresh();
+  },
 };
 $("#search").addEventListener("input", () => library.render());
 $("#search-icon").innerHTML = icon("search");
 $("#refresh-list").innerHTML = icon("refresh");
 $("#refresh-list").onclick = () => library.refresh();
+$("#select-btn").innerHTML = icon("check");
+$("#select-btn").onclick = () => library.setSelecting(true);
+$("#select-done").onclick = () => library.setSelecting(false);
+$("#select-all").onclick = () => library.selectAll();
+$("#select-delete").innerHTML = icon("trash") + "删除";
+$("#select-delete").onclick = () => library.remove([...library.chosen]);
+
+// ---------------------------------------------------------------------------------------------
+// importing recordings copied from elsewhere: the browser reads the files and uploads them, so this works
+// even where the macOS service itself may not look (Desktop, Downloads, a USB stick)
+// ---------------------------------------------------------------------------------------------
+const importer = {
+  running: false,
+  cancelled: false,
+  xhr: null,
+  current: null,
+  choose() {
+    if (this.running) { toast("正在导入，等这一批完成", { level: "warning" }); return; }
+    choiceDialog({
+      title: "导入录像",
+      html: `<p>选一个录像文件夹（里面有 recordings 的那种，或者装着多个录像的上一级文件夹），或者直接选 .mcap 文件。也可以把它们拖到左边的列表上。</p>
+        <p class="muted">会复制一份到 ${esc(library.root || "录像文件夹")}，原来的文件不动。</p>`,
+      buttons: [{ label: "取消" }, { label: "选择 .mcap 文件…", run: () => $("#import-files").click() },
+        { label: "选择文件夹…", kind: "primary", run: () => $("#import-folder").click() }],
+    });
+  },
+  fromInput(input) {
+    const files = [...input.files].map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+    input.value = "";
+    this.run(files);
+  },
+  async fromDrop(dataTransfer) {
+    const entries = [...dataTransfer.items].map((item) => item.webkitGetAsEntry && item.webkitGetAsEntry()).filter(Boolean);
+    const files = [];
+    const walk = async (entry, depth) => {
+      if (entry.name.startsWith(".")) return;
+      if (entry.isFile) {
+        const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+        files.push({ file, path: entry.fullPath.replace(/^\/+/, "") });
+      } else if (entry.isDirectory && depth < 6) {
+        const reader = entry.createReader();
+        for (;;) {
+          const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+          if (!batch.length) break;
+          for (const child of batch) await walk(child, depth + 1);
+        }
+      }
+    };
+    try { for (const entry of entries) await walk(entry, 0); } catch (error) { reportError(error, "读取拖进来的文件失败："); return; }
+    this.run(files);
+  },
+  // Which session folders and loose .mcap files are in a set of files with relative paths.
+  group(files) {
+    const roots = new Set();
+    for (const { path } of files) {
+      const parts = path.split("/").filter(Boolean);
+      const at = parts.indexOf("recordings");
+      if (at >= 1 && at < parts.length - 1) roots.add(parts.slice(0, at).join("/"));
+      else if (parts.length >= 2 && parts[parts.length - 1] === "manifest.json") roots.add(parts.slice(0, -1).join("/"));
+    }
+    const groups = new Map();
+    for (const item of files) {
+      const parts = item.path.split("/").filter(Boolean);
+      if (!parts.length || parts.some((part) => part.startsWith("."))) continue;  // .DS_Store, ._file (exFAT)
+      let root = null;
+      for (let length = parts.length - 1; length >= 1 && !root; length--) {
+        const prefix = parts.slice(0, length).join("/");
+        if (roots.has(prefix)) root = prefix;
+      }
+      if (root) {
+        const name = root.split("/").pop();
+        const group = groups.get("d:" + root) || { name, kind: "folder", files: [], bytes: 0 };
+        group.files.push({ file: item.file, rel: parts.slice(root.split("/").length).join("/") });
+        group.bytes += item.file.size;
+        groups.set("d:" + root, group);
+      } else if (/\.mcap$/i.test(parts[parts.length - 1])) {
+        const name = parts[parts.length - 1];
+        groups.set("f:" + item.path, { name, kind: "file", files: [{ file: item.file, rel: name }], bytes: item.file.size });
+      }
+    }
+    return [...groups.values()];
+  },
+  async run(files) {
+    if (this.running) { toast("正在导入，等这一批完成", { level: "warning" }); return; }
+    const groups = this.group(files);
+    if (!groups.length) { toast("里面没有找到录像", { level: "warning", sub: "要么是带 recordings 文件夹的录像文件夹，要么是 .mcap 文件", timeout: 9000 }); return; }
+    const existing = new Set(library.items.map((item) => item.id));
+    const fresh = groups.filter((group) => !existing.has(group.name));
+    const skipped = groups.length - fresh.length;
+    if (!fresh.length) { toast(groups.length === 1 ? "这个录像已经在列表里了" : "这些录像都已经在列表里了", { level: "warning" }); return; }
+    const total = fresh.reduce((sum, group) => sum + group.bytes, 0);
+    const names = fresh.slice(0, 6).map((group) => `<li><span>${esc(group.name)}</span><span class="muted">${esc(fmtBytes(group.bytes))}</span></li>`).join("")
+      + (fresh.length > 6 ? `<li class="muted">还有 ${fresh.length - 6} 个</li>` : "");
+    const ok = await confirmDialog({
+      title: `导入 ${fresh.length} 个录像？`,
+      html: `<ul class="list-names">${names}</ul><p>共 ${esc(fmtBytes(total))}，会复制到 ${esc(library.root)}。${skipped ? `另有 ${skipped} 个已经在列表里，跳过。` : ""}</p>`,
+      confirm: "导入",
+    });
+    if (!ok) return;
+    this.running = true; this.cancelled = false;
+    $("#import-box").hidden = false;
+    let done = 0, imported = 0;
+    const failures = [];
+    const started = performance.now();
+    const progress = (extra) => {
+      const sent = done + extra;
+      const rate = sent / Math.max(0.5, (performance.now() - started) / 1000);
+      const left = rate > 0 ? (total - sent) / rate : 0;
+      $("#import-text").textContent = `正在导入 ${imported + failures.length + 1}/${fresh.length} · ${fmtBytes(sent)} / ${fmtBytes(total)}` + (sent > 0 && left > 3 ? ` · 约 ${fmtDuration(left)}` : "");
+      $("#import-bar").style.width = `${total ? (100 * sent) / total : 0}%`;
+    };
+    for (const group of fresh) {
+      if (this.cancelled) break;
+      this.current = group.name;
+      const before = done;
+      progress(0);
+      try {
+        await api.post("/api/import/begin", { name: group.name, bytes: group.bytes, kind: group.kind });
+        for (const { file, rel } of group.files) {
+          if (this.cancelled) throw new Error("已取消");
+          await this.upload(group.name, rel, file, (sent) => progress(sent));
+          done += file.size;
+        }
+        await api.post("/api/import/finish", { name: group.name, kind: group.kind });
+        imported++;
+      } catch (error) {
+        failures.push([group.name, error.message]);
+        api.post("/api/import/cancel", { name: group.name }).catch(() => {});
+        done = before + group.bytes;
+      }
+    }
+    this.running = false; this.current = null;
+    $("#import-box").hidden = true;
+    if (imported) toast(`已导入 ${imported} 个录像`, { sub: skipped ? `${skipped} 个已存在，跳过` : "" });
+    for (const [name, message] of failures.slice(0, 3)) toast(`没有导入 ${name}`, { level: message === "已取消" ? "warning" : "error", sub: message, timeout: 10000 });
+    await library.refresh();
+  },
+  upload(name, rel, file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      this.xhr = xhr;
+      const query = new URLSearchParams({ name, path: rel, mtime: String((file.lastModified || 0) / 1000) });
+      xhr.open("POST", "/api/import/file?" + query.toString());
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = (event) => onProgress(event.loaded);
+      xhr.onload = () => {
+        this.xhr = null;
+        if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+        let message = "HTTP " + xhr.status;
+        try { message = JSON.parse(xhr.responseText).error || message; } catch { /* not JSON */ }
+        reject(new Error(message));
+      };
+      xhr.onerror = () => { this.xhr = null; reject(new Error("连接中断")); };
+      xhr.onabort = () => { this.xhr = null; reject(new Error("已取消")); };
+      xhr.send(file);
+    });
+  },
+  cancel() {
+    this.cancelled = true;
+    if (this.xhr) this.xhr.abort();
+  },
+};
+$("#import-btn").innerHTML = icon("upload");
+$("#import-btn").onclick = () => importer.choose();
+$("#import-folder").onchange = () => importer.fromInput($("#import-folder"));
+$("#import-files").onchange = () => importer.fromInput($("#import-files"));
+$("#import-cancel").onclick = () => importer.cancel();
+(function dropTarget() {
+  const view = $("#view-library");
+  let depth = 0;
+  const hasFiles = (event) => [...(event.dataTransfer?.types || [])].includes("Files");
+  view.addEventListener("dragenter", (event) => { if (!hasFiles(event)) return; event.preventDefault(); depth++; view.classList.add("dropping"); });
+  view.addEventListener("dragover", (event) => { if (!hasFiles(event)) return; event.preventDefault(); event.dataTransfer.dropEffect = "copy"; });
+  view.addEventListener("dragleave", () => { depth = Math.max(0, depth - 1); if (!depth) view.classList.remove("dropping"); });
+  view.addEventListener("drop", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault(); depth = 0; view.classList.remove("dropping");
+    importer.fromDrop(event.dataTransfer);
+  });
+  // a file dropped anywhere else must not make the browser navigate away from the app
+  window.addEventListener("dragover", (event) => { if (hasFiles(event)) event.preventDefault(); });
+  window.addEventListener("drop", (event) => { if (hasFiles(event)) event.preventDefault(); });
+})();
 
 // ---------------------------------------------------------------------------------------------
 // playback
@@ -1006,6 +1370,7 @@ const player = {
   dragging: false,
 
   async open(id, item) {
+    $("#view-library").classList.add("has-player");
     const token = ++this.token;
     this.pause();
     this.cache.clear();
@@ -1047,6 +1412,17 @@ const player = {
     $("#t-total").textContent = fmtT(this.duration);
     this.seek(0);
     if (item && item.needs_repair) this.showBanner(item);
+  },
+  close() {
+    $("#view-library").classList.remove("has-player");
+    ++this.token;
+    this.pause();
+    this.cache.clear();
+    this.id = null;
+    this.item = null;
+    $("#player-welcome").hidden = false;
+    $("#player-welcome").textContent = "从左侧选择一次录制";
+    $("#player-head").hidden = $("#play-stage").hidden = $("#transport").hidden = $("#player-banner").hidden = true;
   },
   showBanner(item) {
     $("#player-banner").hidden = false;
@@ -1252,10 +1628,14 @@ $$("#speed button").forEach((button) => button.onclick = () => player.setSpeed(N
 player.setSpeed(1);
 $("#play-layout").innerHTML = icon("columns");
 $("#play-layout").onclick = () => { player.stage.cycleLayout(); $("#play-layout").innerHTML = icon(player.stage.layout === "row" ? "layout" : "columns"); };
-$("#player-reveal").innerHTML = icon("folder") + `在${FINDER}中显示`;
+$("#player-reveal").innerHTML = icon("folder") + `<span class="lbl">在${FINDER}中显示</span>`;
 $("#player-reveal").onclick = () => player.id && api.post(`/api/sessions/${encodeURIComponent(player.id)}/reveal`).catch(reportError);
-$("#player-info").innerHTML = icon("info") + "详情";
+$("#player-info").innerHTML = icon("info") + '<span class="lbl">详情</span>';
 $("#player-info").onclick = () => player.id && details.open(player.id);
+$("#player-delete").innerHTML = icon("trash");
+$("#player-back").innerHTML = icon("chevron");
+$("#player-back").onclick = () => { player.close(); library.selected = null; library.render(); };
+$("#player-delete").onclick = () => player.id && library.remove([player.id]);
 $("#player-repair").onclick = async () => {
   const id = player.id;
   if (!id) return;

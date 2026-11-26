@@ -16,3 +16,5 @@ studio_settings.json
 # OS clutter
 .DS_Store
 Thumbs.db
+tests/screenshots/
+node_modules/

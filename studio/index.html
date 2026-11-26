@@ -53,18 +53,29 @@
     <section class="view" id="view-library">
       <aside class="sidebar">
         <div class="head">
-          <div class="title"><h2>录制记录<span id="session-count"></span></h2><button class="icon-btn" id="refresh-list" title="刷新"></button></div>
+          <div class="title" id="list-title"><h2>录制记录<span id="session-count"></span></h2>
+            <span class="tools"><button class="icon-btn" id="import-btn" title="导入别处拷来的录像（文件夹或 .mcap）"></button><button class="icon-btn" id="select-btn" title="选择多个（删除）"></button><button class="icon-btn" id="refresh-list" title="刷新"></button></span></div>
+          <div class="title select-title" id="select-title" hidden><h2 id="select-count">选择录制</h2>
+            <span class="tools"><button class="btn ghost small" id="select-all">全选</button><button class="btn ghost small" id="select-done">完成</button></span></div>
           <label class="search"><span id="search-icon"></span><input id="search" placeholder="搜索地点、备注、序列号" autocomplete="off"></label>
         </div>
+        <div class="import-box" id="import-box" hidden>
+          <div class="row1"><span id="import-text"></span><button class="btn ghost small" id="import-cancel">取消</button></div>
+          <div class="bar"><div id="import-bar"></div></div>
+        </div>
         <div class="sessions" id="session-list"></div>
+        <div class="select-bar" id="select-bar" hidden><span id="select-size"></span><button class="btn danger small" id="select-delete" disabled>删除</button></div>
+        <div class="drop-hint" id="drop-hint"><div><b>松开即可导入</b><span>录像文件夹或 .mcap 文件，会复制一份到录像文件夹</span></div></div>
       </aside>
       <div class="player" id="player">
         <div class="welcome" id="player-welcome">从左侧选择一次录制</div>
         <div class="player-head" id="player-head" hidden>
+          <button class="icon-btn back" id="player-back" title="返回列表"></button>
           <div class="ttl"><div class="t1"><span id="player-title"></span><span class="tag" id="player-tag"></span></div><div class="t2" id="player-sub"></div></div>
           <div class="acts">
             <button class="btn ghost small" id="player-reveal"></button>
             <button class="btn small" id="player-info"></button>
+            <button class="icon-btn danger" id="player-delete" title="删除这个录制"></button>
           </div>
         </div>
         <div class="banner" id="player-banner" hidden><span id="player-banner-text"></span><button class="btn small" id="player-repair">修复</button></div>
@@ -143,7 +154,13 @@
         <button class="btn ghost small" id="camera-restart" title="停下数据流再打开，几秒">重新打开相机</button>
         <button class="btn ghost small" id="camera-reset" title="相机断开再重新连上，和拔插一次一样，约 10 秒">硬件复位</button>
         <button class="btn ghost small" id="service-restart" title="后台程序退出后由系统自动重新启动，约 15 秒" hidden>重启后台服务</button>
+        <button class="btn ghost small" id="service-quit"></button>
       </div>
+      <p class="note" id="service-note"></p>
+    </div>
+    <div class="section">
+      <h3>自检 <button class="btn ghost small" id="doctor-run">重新检查</button></h3>
+      <div class="checks" id="doctor"></div>
     </div>
     <div class="section">
       <h3>日志</h3>
@@ -157,6 +174,10 @@
   <div class="body" id="details-body"></div>
 </aside>
 
+<div class="modal" id="modal" hidden><div class="box" role="dialog" aria-modal="true"><h3 id="modal-title"></h3><div class="body" id="modal-body"></div><div class="actions" id="modal-actions"></div></div></div>
+<div class="closed" id="closed" hidden><div class="box"><div class="glyph" id="closed-glyph"></div><h2 id="closed-title"></h2><p id="closed-text"></p><button class="btn primary" id="closed-reopen">重新打开</button></div></div>
+<input type="file" id="import-folder" webkitdirectory multiple hidden>
+<input type="file" id="import-files" accept=".mcap" multiple hidden>
 <div class="toasts" id="toasts"></div>
 <script src="app.js"></script>
 </body>

@@ -5,9 +5,14 @@
     bash studio.sh                  macOS / Linux: starts the app and opens http://127.0.0.1:8455
     studio.bat                      Windows
     python d455_studio.py --simulate    no camera needed: a simulated D455
+    python d455_studio.py --doctor      check this computer and the camera connection, explain problems
 
 What it adds: a live view of color, depth and infrared, start/stop recording with the settings in the
-browser, and playback of recorded sessions as synchronized video with a timeline.
+browser, playback of recorded sessions as synchronized video with a timeline, importing recordings copied
+from elsewhere (session folders or loose .mcap files), deleting recordings, and a self check that says in
+plain words why a camera is not found or does not stream. On macOS, install_service.sh runs it as an
+on-demand launchd service: launchd holds the port, a request starts the program, and the program exits when
+no page has asked for anything for a few minutes.
 
 What it does NOT re-implement: everything that touches the camera or the files comes from record_d455.py.
 Stream planning, option handling, the macOS workarounds (sudo, IMU crash guard, USB hold, the start check
@@ -45,12 +50,14 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import record_d455 as rd  # noqa: E402  (the recorder is the library)
 
-__version__ = "1.0.0"
-BUILT_AGAINST = "1.2.8"
+__version__ = "1.1.0"
+BUILT_AGAINST = "1.2.9"
 WEB_ROOT = HERE / "studio"
 SETTINGS_PATH = HERE / "studio_settings.json"
 DEFAULT_PORT = 8455
 IDLE_AFTER_S = 60.0  # no live view open and no recording for this long: stop streaming (projector off, no CPU)
+EXIT_AFTER_S = 300.0  # macOS service: no page open and nothing running for this long: exit (launchd starts it again)
+SESSION_NAME = re.compile(r"[A-Za-z0-9._\-]+")
 
 LABELS = {"color": "彩色", "depth": "深度", "ir_left": "红外", "ir_right": "右红外"}
 VIEW_ORDER = ("color", "depth", "ir_left", "ir_right")
@@ -397,6 +404,7 @@ class LiveCamera:
         self.rs = rs
         self.idle_after = idle_after if idle_after > 0 else float("inf")
         self.service = False  # started by launchd (install_service.sh): the page may restart the process
+        self.exit_after = 0.0  # the process exits after this long without requests (0: never)
         self.log_dir = log_dir or HERE / "logs"
         self.settings = settings
         self.out_root = out_root
@@ -420,7 +428,7 @@ class LiveCamera:
         self.depth_units: Optional[float] = None
         self.frame_seq = 0
         self.last_viewer = 0.0
-        self.last_client = time.monotonic()  # a live view (or the settings panel) asked for the camera
+        self.last_client = float("-inf")  # a live view (or the settings panel) asked for the camera; not yet
         self.wake = threading.Event()
         self.context = None
         self.events: deque = deque(maxlen=200)
@@ -429,13 +437,16 @@ class LiveCamera:
         self._write_mark: Tuple[float, int] = (time.monotonic(), 0)
         self._write_rate = 0.0
         self.library: Optional["Library"] = None
+        self.startup_findings: List[Dict[str, str]] = []
+        self.diagnostics: Tuple[float, List[Dict[str, str]]] = (0.0, [])
 
     # ---- events ---------------------------------------------------------------------------
     def event(self, level: str, message: str, source: str = "studio") -> None:
+        known = explain(message) if level != "info" else None
         with self.lock:
             self.event_id += 1
             self.events.append({"id": self.event_id, "time": now_iso(), "level": level, "message": message,
-                                "source": source})
+                                "source": source, "hint": known[1] if known else ""})
         if source == "studio":
             rd.log("[studio] " + message)
 
@@ -452,9 +463,10 @@ class LiveCamera:
         if self.state == "idle":
             self.wake.set()
 
-    def _sleep_until_wanted(self, is_present: Optional[Callable[[], bool]]) -> bool:
+    def _sleep_until_wanted(self, is_present: Optional[Callable[[], bool]],
+                            message: str = "相机待机中（打开「实时」页会自动唤醒）") -> bool:
         """Camera closed until a client asks for it. False if the camera was unplugged meanwhile."""
-        self._set_state("idle", "相机待机中（打开「实时」页会自动唤醒）")
+        self._set_state("idle", message)
         self.wake.clear()
         checked = time.monotonic()
         while not self.shutdown.is_set():
@@ -514,6 +526,10 @@ class LiveCamera:
         self.thread.start()
 
     def _run(self) -> None:
+        # Nothing touches the camera before a page asks for it: macOS keeps it (and other programs can use it)
+        # while the page only plays recordings back.
+        if self.last_client == float("-inf"):
+            self._sleep_until_wanted(None, "相机还没打开（打开「实时」页会自动连接）")
         while not self.shutdown.is_set():
             try:
                 if self.simulate:
@@ -702,7 +718,8 @@ class LiveCamera:
                 raise RuntimeError("已经在录制")
             host = self.host
             if self.state != "streaming" or host is None:
-                raise RuntimeError("相机还没有出图，不能开始录制")
+                self.touch()
+                raise RuntimeError("相机还没有出图，不能开始录制" if self.state != "idle" else "相机正在打开，几秒后再试")
             values = self.settings.snapshot()
             config = rd.RecordConfig(
                 out_root=self.out_root, streams=tuple(values["streams"]), depth_size=host.config.depth_size,
@@ -1016,7 +1033,7 @@ class LiveCamera:
             events = [item for item in self.events if item["id"] > since_event]
         return {"version": __version__, "recorder_version": rd.__version__, "camera": camera, "streams": streams,
                 "recording": recording, "last_result": self.last_result, "events": events[-50:],
-                "event_id": self.event_id, "settings": self.settings.snapshot(),
+                "event_id": self.event_id, "settings": self.settings.snapshot(), "exit_after": self.exit_after,
                 "disk": {"free": free, "path": str(self.out_root.resolve())}}
 
     def stop(self) -> None:
@@ -1031,6 +1048,44 @@ class LiveCamera:
 # --------------------------------------------------------------------------------------------
 MCAP_MAGIC = b"\x89MCAP0\r\n"
 OP_SCHEMA, OP_CHANNEL, OP_MESSAGE, OP_CHUNK, OP_MESSAGE_INDEX = 0x03, 0x04, 0x05, 0x06, 0x07
+
+
+def is_mcap(path: Path) -> bool:
+    # "._name.mcap" are the resource-fork files macOS leaves next to every file on FAT/exFAT drives
+    return path.suffix.lower() == ".mcap" and not path.name.startswith(".")
+
+
+def recording_files(path: Path) -> List[Path]:
+    """The MCAP files of a session: recordings/*.mcap of a session folder, or one loose .mcap file."""
+    if path.is_file():
+        return [path] if is_mcap(path) else []
+    folder = path / "recordings"
+    try:
+        return sorted(item for item in folder.iterdir() if is_mcap(item) and item.is_file())
+    except OSError:
+        return []
+
+
+def is_session_dir(path: Path) -> bool:
+    return (path / "manifest.json").is_file() or (path / "recordings").is_dir()
+
+
+def mcap_span(paths: List[Path]) -> Optional[Tuple[int, int]]:
+    """(first, last) log_time in ns from the summaries of finalized files; None if no file has one."""
+    span = None
+    for path in paths:
+        try:
+            from mcap.reader import make_reader
+            with path.open("rb") as handle:
+                summary = make_reader(handle).get_summary()
+            stats = summary.statistics if summary is not None else None
+        except Exception:
+            stats = None
+        if stats is None or not stats.message_count:
+            continue
+        low, high = int(stats.message_start_time), int(stats.message_end_time)
+        span = (low, high) if span is None else (min(span[0], low), max(span[1], high))
+    return span
 
 
 def _read_string(buffer: bytes, position: int) -> Tuple[str, int]:
@@ -1214,18 +1269,17 @@ class McapFile:
 class SessionIndex:
     """All recordings of one session, merged per stream and sorted by log_time."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, session_id: str = "") -> None:
         import numpy as np
 
         self.directory = directory
-        self.session_id = directory.name
+        self.session_id = session_id or directory.name
         self.manifest: Dict[str, Any] = {}
         try:
             self.manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         except Exception:
             pass
-        self.files = [McapFile(path) for path in sorted((directory / "recordings").glob("*.mcap"))
-                      if path.stat().st_size > 8]
+        self.files = [McapFile(path) for path in recording_files(directory) if path.stat().st_size > 8]
         if not self.files:
             raise FileNotFoundError("这个 session 里还没有可读的 .mcap 文件")
         merged: Dict[str, List[Tuple[int, int, Any]]] = {}
@@ -1341,7 +1395,7 @@ class SessionIndex:
 
 def first_image(directory: Path, prefer: Tuple[str, ...] = ("color", "ir_left", "depth")) -> Optional[Tuple[str, bytes]]:
     """The first recorded image of a session, read from the start of its first file (for thumbnails)."""
-    recordings = sorted((directory / "recordings").glob("*.mcap"))
+    recordings = recording_files(directory)
     if not recordings:
         return None
     path = recordings[0]
@@ -1396,8 +1450,38 @@ def first_image(directory: Path, prefer: Tuple[str, ...] = ("color", "ir_left", 
     return None
 
 
+def valid_name(part: str) -> bool:
+    """One path component of a session id: any file name except hidden ones and anything with a separator."""
+    return 0 < len(part) <= 255 and not part.startswith(".") and not any(char in part for char in "/\\\x00")
+
+
+def tree_size(path: Path) -> int:
+    if path.is_symlink() or path.is_file():
+        try:
+            return path.lstat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for folder, _dirs, files in os.walk(str(path)):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(folder, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
 class Library:
-    """The session folder: listing, thumbnails, opened indexes."""
+    """The session folder: listing, thumbnails, opened indexes, deleting and importing.
+
+    What counts as a recording, so that folders copied from another computer show up as they are:
+      <root>/<session>/            a session folder (manifest.json and/or recordings/*.mcap)
+      <root>/<file>.mcap           one loose MCAP file
+      <root>/<folder>/<session>/   the same one level down, e.g. a whole sessions folder copied in
+      <root>/<folder>/<file>.mcap
+    Session ids are the path below <root> ("a" or "a/b")."""
+
+    IMPORT_PREFIX = ".importing-"
 
     def __init__(self, root: Path, camera: Optional[LiveCamera]) -> None:
         self.root = root
@@ -1405,50 +1489,87 @@ class Library:
         self.lock = threading.Lock()
         self.indexes: "OrderedDict[str, SessionIndex]" = OrderedDict()
         self.thumbs: Dict[str, Tuple[float, bytes]] = {}
-        self.summaries: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self.summaries: Dict[str, Tuple[Tuple, Dict[str, Any]]] = {}
+        self.importing: Dict[str, float] = {}  # import name -> last activity (monotonic)
 
     def directory(self, session_id: str) -> Path:
-        if not re.fullmatch(r"[A-Za-z0-9._\-]+", session_id or "") or session_id.startswith("."):
+        parts = (session_id or "").split("/")
+        if not 1 <= len(parts) <= 2 or not all(valid_name(part) for part in parts):
             raise KeyError("bad session id")
-        path = self.root / session_id
-        if not path.is_dir():
-            raise KeyError("session not found")
-        return path
+        path = self.root.joinpath(*parts)
+        if path.is_dir() or (path.is_file() and is_mcap(path)):
+            return path
+        raise KeyError("session not found")
 
     def live_session(self) -> str:
         recorder = self.camera.recorder if self.camera else None
         return recorder.session_id if recorder is not None else ""
 
-    def summary(self, path: Path) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _children(folder: Path) -> List[Path]:
+        try:
+            return sorted(path for path in folder.iterdir() if not path.name.startswith("."))
+        except OSError:
+            return []
+
+    def entries(self) -> List[Tuple[str, Path]]:
+        found = []
+        for path in self._children(self.root):
+            if path.is_file():
+                if is_mcap(path):
+                    found.append((path.name, path))
+            elif path.is_dir():
+                if is_session_dir(path):
+                    found.append((path.name, path))
+                    continue
+                for child in self._children(path):
+                    if (child.is_file() and is_mcap(child)) or (child.is_dir() and is_session_dir(child)):
+                        found.append((path.name + "/" + child.name, child))
+        return found
+
+    def summary(self, path: Path, session_id: str = "") -> Optional[Dict[str, Any]]:
+        session_id = session_id or path.name
+        single = path.is_file()
         manifest_path = path / "manifest.json"
-        recordings = sorted((path / "recordings").glob("*.mcap"))
-        if not manifest_path.is_file() and not recordings:
+        has_manifest = not single and manifest_path.is_file()
+        recordings = recording_files(path)
+        if not has_manifest and not recordings:
             return None
-        stamp = max([manifest_path.stat().st_mtime if manifest_path.is_file() else 0.0] +
-                    [item.stat().st_mtime for item in recordings])
-        cached = self.summaries.get(path.name)
+        stats = [item.stat() for item in recordings] + ([manifest_path.stat()] if has_manifest else [])
+        stamp = tuple((item.st_mtime, item.st_size) for item in stats)
+        cached = self.summaries.get(session_id)
         if cached and cached[0] == stamp:
             item = dict(cached[1])
         else:
             manifest: Dict[str, Any] = {}
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            if has_manifest:
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
             size = sum(item.stat().st_size for item in recordings)
             streams = manifest.get("streams") or {}
             verify = manifest.get("verify") or {}
             duration = manifest.get("duration_s")
+            created = manifest.get("created_local")
             if duration is None and manifest.get("status") == "recovered":  # repair does not write duration_s
                 try:
                     report = json.loads((path / "derived" / "verify_report.json").read_text(encoding="utf-8"))
                     duration = max(entry.get("duration_s") or 0 for entry in report.get("streams", {}).values()) or None
                 except Exception:
                     duration = None
+            if not manifest:  # a recording without its session folder: what the files themselves say
+                span = mcap_span(recordings)
+                if span is not None:
+                    duration = (span[1] - span[0]) / 1e9
+                    created = datetime.fromtimestamp(span[0] / 1e9).astimezone().isoformat()
+            if not created:
+                created = datetime.fromtimestamp(max(item.st_mtime for item in stats)).astimezone().isoformat()
             device = manifest.get("device") or {}
-            created = manifest.get("created_local") or datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
+            status = manifest.get("status", "unknown")
             item = {
-                "id": path.name, "created": created, "status": manifest.get("status", "unknown"),
+                "id": session_id, "name": path.name, "folder": session_id.rpartition("/")[0],
+                "kind": "file" if single else "session", "created": created, "status": status,
                 "duration_s": duration, "bytes": size, "files": len(recordings),
                 "device": {"name": device.get("name", ""), "serial": device.get("serial_number", "")},
                 "streams": {name: {"width": entry.get("width"), "height": entry.get("height"), "fps": entry.get("fps")}
@@ -1457,21 +1578,17 @@ class Library:
                 "warnings": verify.get("warnings") or [], "scene": manifest.get("scene") or {},
                 "stop_reason": manifest.get("stop_reason"), "frames": manifest.get("total_frames"),
             }
-            self.summaries[path.name] = (stamp, dict(item))
-        live = item["id"] == self.live_session()
+            self.summaries[session_id] = (stamp, dict(item))
+        live = session_id == self.live_session()
         item["live"] = live
         item["needs_repair"] = item["status"] == "recording" and not live and not rd.session_is_live(path)
         return item
 
     def list(self) -> List[Dict[str, Any]]:
         items = []
-        try:
-            folders = [path for path in self.root.iterdir() if path.is_dir() and not path.name.startswith(".")]
-        except OSError:
-            folders = []
-        for path in folders:
+        for session_id, path in self.entries():
             try:
-                item = self.summary(path)
+                item = self.summary(path, session_id)
             except Exception:
                 item = None
             if item is not None:
@@ -1487,7 +1604,7 @@ class Library:
                 return existing
         if session_id == self.live_session():
             raise RuntimeError("这个 session 正在录制，停止后才能回放")
-        index = SessionIndex(self.directory(session_id))
+        index = SessionIndex(self.directory(session_id), session_id)
         with self.lock:
             self.indexes[session_id] = index
             while len(self.indexes) > 3:
@@ -1508,7 +1625,7 @@ class Library:
         import numpy as np
 
         path = self.directory(session_id)
-        recordings = sorted((path / "recordings").glob("*.mcap"))
+        recordings = recording_files(path)
         stamp = recordings[0].stat().st_mtime if recordings else 0.0
         cached = self.thumbs.get(session_id)
         if cached and cached[0] == stamp:
@@ -1542,6 +1659,475 @@ class Library:
                                 .get("events", []) if item.get("level") != "info"][-30:]
         return result
 
+    # ---- deleting -----------------------------------------------------------------------------
+    def delete(self, session_ids: List[str]) -> Dict[str, Any]:
+        """Delete recordings for good (a background service cannot use the user's Trash on macOS)."""
+        deleted: List[str] = []
+        failed: List[Dict[str, str]] = []
+        freed = 0
+        live = self.live_session()
+        for session_id in session_ids:
+            try:
+                path = self.directory(str(session_id))
+                if session_id == live:
+                    raise RuntimeError("正在录制，停止后才能删除")
+                if path.is_dir() and not path.is_symlink():
+                    if not is_session_dir(path):
+                        raise RuntimeError("不是一个录制文件夹")
+                    if rd.session_is_live(path):
+                        try:
+                            status = json.loads((path / "manifest.json").read_text(encoding="utf-8")).get("status")
+                        except Exception:
+                            status = None
+                        if status == "recording":
+                            raise RuntimeError("另一个程序正在往里面写（比如 run.sh 正在录制）")
+                size = tree_size(path)
+                self.forget(session_id)
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(str(path))
+                else:
+                    path.unlink()  # a loose file, or a link to a folder elsewhere (the folder itself stays)
+                deleted.append(session_id)
+                freed += size
+                rd.log("[studio] deleted {} ({:.1f} MB)".format(session_id, size / 1e6))
+            except Exception as error:
+                failed.append({"id": str(session_id), "error": str(error).strip("'\"")})
+        return {"deleted": deleted, "failed": failed, "freed": freed}
+
+    # ---- importing (the page uploads files the browser may read; the service may not, on macOS) ----------
+    def _staging(self, name: str) -> Path:
+        if not valid_name(name):
+            raise ValueError("不能用这个名字：{}".format(name))
+        return self.root / (self.IMPORT_PREFIX + name)
+
+    def clean_imports(self) -> None:
+        """Half-finished imports of an earlier run (the page was closed during the upload)."""
+        try:
+            leftovers = [path for path in self.root.iterdir() if path.name.startswith(self.IMPORT_PREFIX)]
+        except OSError:
+            return
+        for path in leftovers:
+            shutil.rmtree(str(path), ignore_errors=True)
+
+    def import_begin(self, name: str, total: int) -> Dict[str, Any]:
+        staging = self._staging(name)
+        if (self.root / name).exists():
+            raise FileExistsError("已经有一个叫 {} 的录制".format(name))
+        free = shutil.disk_usage(str(self.root)).free
+        if total + 2e9 > free:
+            raise RuntimeError("空间不够：需要 {:.1f} GB，剩 {:.1f} GB".format(total / 1e9, free / 1e9))
+        if staging.exists():
+            shutil.rmtree(str(staging), ignore_errors=True)
+        staging.mkdir(parents=True)
+        self.importing[name] = time.monotonic()
+        return {"ok": True}
+
+    def import_file(self, name: str, relative: str, length: int, source: Any, mtime: float = 0.0) -> None:
+        staging = self._staging(name)
+        if name not in self.importing or not staging.is_dir():
+            raise RuntimeError("这次导入已经结束或被取消")
+        parts = relative.split("/")
+        if not 1 <= len(parts) <= 4 or not all(valid_name(part) for part in parts):
+            raise ValueError("不能导入这个文件：{}".format(relative))
+        target = staging.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + ".part")
+        remaining = length
+        with partial.open("wb") as handle:
+            while remaining > 0:
+                block = source.read(min(remaining, 1 << 20))
+                if not block:
+                    break
+                handle.write(block)
+                remaining -= len(block)
+                self.importing[name] = time.monotonic()
+        if remaining:
+            partial.unlink()
+            raise ConnectionError("upload of {} ended early".format(relative))
+        partial.replace(target)
+        if mtime > 0:
+            try:
+                os.utime(str(target), (mtime, mtime))
+            except OSError:
+                pass
+
+    def import_finish(self, name: str, kind: str) -> Dict[str, Any]:
+        staging = self._staging(name)
+        if name not in self.importing:
+            raise RuntimeError("这次导入已经结束或被取消")
+        target = self.root / name
+        if target.exists():
+            raise FileExistsError("已经有一个叫 {} 的录制".format(name))
+        if kind == "file":
+            (staging / name).replace(target)
+            shutil.rmtree(str(staging), ignore_errors=True)
+        else:
+            staging.replace(target)
+        self.importing.pop(name, None)
+        rd.hand_back_ownership(target, recursive=True)
+        self.forget(name)
+        rd.log("[studio] imported {} ({:.1f} MB)".format(name, tree_size(target) / 1e6))
+        return {"id": name}
+
+    def import_cancel(self, name: str) -> None:
+        staging = self._staging(name)
+        self.importing.pop(name, None)
+        shutil.rmtree(str(staging), ignore_errors=True)
+
+    def busy(self) -> bool:
+        now = time.monotonic()
+        return any(now - seen < 120 for seen in self.importing.values())
+
+
+# --------------------------------------------------------------------------------------------
+# Self check: the same checks for the installer, `d455_studio.py --doctor` and the page. Each finding says
+# what was seen, the likely reason and what to do, in the words a user needs (not an error code).
+# --------------------------------------------------------------------------------------------
+SERVICE_LABEL = "local.d455studio"
+SERVICE_LOG = Path("/Library/Logs/D455Studio/studio.log")
+MB_PER_S_DEFAULT = 15.0  # measured for the default streams on the Mac (2026-11-26): about 54 GB per hour
+
+# Known messages from the SDK, libusb, macOS and record_d455, and what they mean for the user.
+KNOWN_PROBLEMS: List[Tuple[str, str, str]] = [
+    (r"failed to set power state|failed to claim usb interface|LIBUSB_ERROR_(ACCESS|BUSY)|Device or resource busy",
+     "SDK 没能拿到相机的 USB 接口：另一个程序正在用这台相机，或者没有管理员权限",
+     "退出正在用摄像头的程序（视频会议、浏览器里的视频页面、Photo Booth、RealSense Viewer、另一个 run.sh 或 studio.sh），"
+     "拔下相机等 5 秒再插回。Linux 上还要装 RealSense 的 udev 规则。"),
+    (r"pipe ref not recognized",
+     "macOS 的系统相机服务（UVCAssistant）把彩色接口拿回去了，SDK 手里的数据通道失效",
+     "拔插一次相机，程序会重新接管；反复出现就点「硬件复位」或重启后台服务。"),
+    (r"no live frames from|did not deliver|silent",
+     "相机打开了，但有一路画面一直没有数据",
+     "多半是 USB 带宽或接触问题：用标 5 Gb/s 以上的 USB 3 数据线，直接插电脑（不经过 Hub），USB-C 插头推到底；仍不行就点「硬件复位」。"),
+    (r"IOHIDDeviceOpen|SIGSEGV|Segmentation fault|hid_open",
+     "SDK 在打开相机的 IMU（运动传感器）接口时崩溃，这是 macOS 26 以后 pyrealsense2-macosx 的已知问题",
+     "需要 IMU 崩溃防护：重新运行 bash install_service.sh（会用 Xcode 命令行工具编译它）。"),
+    (r"Timeout \(0:|took longer than|start_hang",
+     "打开相机时 SDK 卡住不返回，程序已经自己退出重启",
+     "拔插一次相机再打开网页。反复出现时把 /Library/Logs/D455Studio 里的 start_hang_*.txt 发给开发者。"),
+    (r"Operation not permitted|PermissionError: \[Errno 1\]",
+     "macOS 不允许后台服务访问这个位置（桌面、文稿、下载、外接盘都受保护）",
+     "把录像目录放在 ~/D455/sessions（默认）：bash install_service.sh --sessions ~/D455/sessions"),
+    (r"disk_full|No space left on device",
+     "磁盘满了，录制已经停止",
+     "在「回放」里删掉不要的录制，或者换一个空间大的磁盘。"),
+    (r"Address already in use",
+     "端口被别的程序占着",
+     "运行 bash install_service.sh doctor 查看是哪个程序；关掉它或换端口：bash install_service.sh --port 8456"),
+]
+
+
+def explain(text: str) -> Optional[Tuple[str, str]]:
+    """(reason, fix) for a known error message, else None."""
+    for pattern, reason, fix in KNOWN_PROBLEMS:
+        if re.search(pattern, text or "", re.IGNORECASE):
+            return reason, fix
+    return None
+
+
+def _finding(level: str, title: str, detail: str = "", fix: str = "", key: str = "") -> Dict[str, str]:
+    return {"level": level, "title": title, "detail": detail, "fix": fix, "key": key or title}
+
+
+def _run(command: List[str], timeout: float = 15.0) -> str:
+    try:
+        return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def check_system() -> List[Dict[str, str]]:
+    import platform
+    found = []
+    machine = platform.machine()
+    if sys.platform == "darwin":
+        version = platform.mac_ver()[0] or "?"
+        major = int(version.split(".")[0]) if version.split(".")[0].isdigit() else 0
+        chip = "Apple 芯片" if machine == "arm64" else "Intel 芯片" if machine == "x86_64" else machine
+        translated = _run(["sysctl", "-n", "sysctl.proc_translated"]).strip() == "1"
+        if major and major < 12:
+            found.append(_finding("bad", "macOS {} 太旧".format(version), "RealSense 的 macOS 版 SDK 需要 macOS 12 或更新。",
+                                  "升级 macOS，或者在 Windows / Ubuntu 电脑上用。", "system"))
+        elif translated:
+            found.append(_finding("warn", "macOS {}，{}，但这个 Python 在 Rosetta 下运行".format(version, chip),
+                                  "用的是 Intel 版 Python，USB 访问和速度都没有保证。",
+                                  "用原生终端重新运行 bash install_service.sh（终端的「显示简介」里取消「使用 Rosetta 打开」）。", "system"))
+        else:
+            found.append(_finding("ok", "macOS {}，{}".format(version, chip), key="system"))
+    elif sys.platform.startswith("linux"):
+        name = ""
+        try:
+            name = next((line.split("=", 1)[1].strip().strip('"') for line in Path("/etc/os-release").read_text().splitlines()
+                         if line.startswith("PRETTY_NAME=")), "")
+        except OSError:
+            pass
+        found.append(_finding("ok", "{}，{}".format(name or "Linux", machine), key="system"))
+    else:
+        found.append(_finding("ok", "{} {}，{}".format(platform.system(), platform.release(), machine), key="system"))
+    return found
+
+
+def check_python(rs: Any) -> List[Dict[str, str]]:
+    import platform
+    version = getattr(rs, "__version__", "") if rs is not None else ""
+    if rs is None:
+        return [_finding("bad", "pyrealsense2 没有装好", "Python 导入 RealSense SDK 失败。",
+                         "macOS：重新运行 bash install_service.sh；Windows / Linux：删掉 .venv 文件夹再运行 studio.bat / studio.sh。",
+                         "python")]
+    return [_finding("ok", "Python {}，pyrealsense2 {}，录制器 {}".format(platform.python_version(), version or "?",
+                                                                     rd.__version__), key="python")]
+
+
+def check_guard(service: bool) -> List[Dict[str, str]]:
+    if sys.platform != "darwin":
+        return []
+    path = rd.macos_hid_guard_path()
+    if rd.hid_guard_loaded():
+        return [_finding("ok", "IMU 崩溃防护已生效", key="guard")]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return [_finding("bad", "IMU 崩溃防护没有生效", rd.HID_GUARD_STATE.get("note", ""),
+                         "重新运行 bash install_service.sh；如果提示缺 Xcode 命令行工具，先运行 xcode-select --install。", "guard")]
+    if path.is_file():
+        return [_finding("ok", "IMU 崩溃防护已编译好（打开相机时自动加载）", key="guard")]
+    return [_finding("warn", "IMU 崩溃防护还没编译", "第一次以管理员身份打开相机时会自动编译，需要 Xcode 命令行工具。",
+                     "终端运行 xcode-select --install（已经装过会提示 already installed）。", "guard")]
+
+
+def usb_view() -> Optional[Dict[str, Any]]:
+    """What the operating system itself sees on USB, without the SDK: {"listed": bool, "speed": text, "mbps": n}.
+    None when this system cannot tell."""
+    if sys.platform == "darwin":
+        view = rd.macos_usb_view()
+        if view is None:
+            return None
+        if not view:
+            ports = rd.macos_usb_c_ports()
+            dead = [item["port"] for item in ports if item["plug"] and not [link for link in item["links"] if link != "CC"]]
+            return {"listed": False, "dead_ports": dead}
+        speed = view.get("speed", "")
+        match = re.search(r"([\d.]+)\s*([GM])b", speed)
+        mbps = float(match.group(1)) * (1000 if match.group(2) == "G" else 1) if match else 0
+        return {"listed": True, "speed": speed, "mbps": mbps, "name": view.get("name", "")}
+    if sys.platform.startswith("linux"):
+        root = Path("/sys/bus/usb/devices")
+        if not root.is_dir():
+            return None
+        for device in root.iterdir():
+            try:
+                vendor = (device / "idVendor").read_text().strip()
+                product = int((device / "idProduct").read_text().strip(), 16)
+            except (OSError, ValueError):
+                continue
+            if vendor == "8086" and product in rd.REALSENSE_PRODUCT_IDS:
+                try:
+                    mbps = float((device / "speed").read_text().strip())
+                except (OSError, ValueError):
+                    mbps = 0
+                return {"listed": True, "speed": "{:.0f} Mb/s".format(mbps), "mbps": mbps, "name": "RealSense"}
+        return {"listed": False}
+    return None
+
+
+def check_usb(camera: Optional["LiveCamera"]) -> List[Dict[str, str]]:
+    view = usb_view()
+    streaming = camera is not None and camera.state == "streaming"
+    if view is None:
+        return []
+    if not view["listed"]:
+        if streaming:
+            return []
+        detail = "系统的 USB 设备列表里没有 RealSense，问题在线、接口或系统权限，和软件无关。"
+        if view.get("dead_ports"):
+            detail = "{} 检测到有插头，但没有建立任何数据连接：线没有数据芯（充电线）或插头没插到底。".format(", ".join(view["dead_ports"]))
+        fix = "用标 5 Gb/s 以上的 USB 3 数据线直接插电脑，USB-C 插头推到底（D455 的接口比外壳深）。"
+        if sys.platform == "darwin":
+            fix += " macOS 弹出「允许配件连接？」时要点允许；之前点过不允许的，到 系统设置 > 隐私与安全性 > 允许配件连接 改成「询问」后重插。"
+        else:
+            fix += " 不要经过扩展坞或 Hub。"
+        return [_finding("warn", "系统没有检测到相机", detail, fix, "usb")]
+    if view.get("mbps") and view["mbps"] < 1000:
+        return [_finding("warn", "相机是 USB 2 连接（{}）".format(view["speed"]),
+                         "USB 2 只有 480 Mb/s，默认的三路画面跑不满，会丢帧或打不开。",
+                         "换一根 USB 3 数据线（标 5 Gb/s 或 10 Gb/s），把 USB-C 插头翻面再插一次，直接插电脑。", "usb")]
+    return [_finding("ok", "系统检测到相机，USB {}".format(view.get("speed") or "已连接"), key="usb")]
+
+
+def check_camera(camera: Optional["LiveCamera"]) -> List[Dict[str, str]]:
+    if camera is None or camera.simulate:
+        return [] if camera is None else [_finding("ok", "模拟相机", key="camera")]
+    info = camera.device_info
+    found = []
+    if camera.state == "streaming":
+        name = info.get("name", "RealSense").replace("Intel RealSense ", "")
+        found.append(_finding("ok", "{} 正常出图（序列号 {}）".format(name, info.get("serial_number", "?")), key="camera"))
+        usb = info.get("usb_type_descriptor", "")
+        if usb.startswith("2"):
+            found.append(_finding("warn", "SDK 报告相机是 USB {} 连接".format(usb), "带宽不够默认画面。",
+                                  "换 USB 3 数据线，插头翻面重插，直接插电脑。", "usb_sdk"))
+        firmware, recommended = info.get("firmware_version", ""), info.get("recommended_firmware_version", "")
+        if firmware and recommended and _version_tuple(firmware) < _version_tuple(recommended):
+            found.append(_finding("info", "相机固件 {}，SDK 推荐 {}".format(firmware, recommended),
+                                  "旧固件一般也能正常录制。",
+                                  "想升级可以在 Windows 或 Linux 上用 RealSense Viewer（More > Update Firmware）。", "firmware"))
+        return found
+    if camera.state == "idle":
+        return [_finding("info", "相机待机", "没有页面在看实时画面时相机是关着的，打开「实时」页会自动连接。", key="camera")]
+    if camera.state in ("waiting", "error", "opening"):
+        view = usb_view()
+        if view and view.get("listed") and camera.state != "opening":
+            detail = "系统看得到相机，但 SDK 打不开它。"
+            fix = KNOWN_PROBLEMS[0][2]
+            if sys.platform == "darwin":
+                owners = " ".join(rd.macos_interface_owners())
+                if "UVCAssistant" in owners:
+                    detail += "macOS 的相机服务（UVCAssistant）正占着相机的接口，通常是因为别的程序在用摄像头。"
+            last = rd.LAST_SDK_ERROR.get("text", "")
+            if last:
+                detail += " SDK 的报错：" + last[:200]
+                known = explain(last)
+                if known:
+                    detail, fix = known[0] + "。SDK 的报错：" + last[:200], known[1]
+            return [_finding("bad", "相机打不开", detail, fix, "camera")]
+        if camera.state == "error":
+            known = explain(camera.message)
+            return [_finding("bad", "相机出错", camera.message, known[1] if known else "点「重新打开相机」；不行就拔插一次。", "camera")]
+    return found
+
+
+def _version_tuple(text: str) -> Tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", text)[:4])
+
+
+def check_storage(out_root: Path) -> List[Dict[str, str]]:
+    try:
+        out_root.mkdir(parents=True, exist_ok=True)
+        probe = out_root / ".d455_write_test"
+        probe.write_bytes(b"ok")
+        probe.unlink()
+    except OSError as error:
+        known = explain(str(error))
+        return [_finding("bad", "录像目录写不进去", "{}：{}".format(out_root, error),
+                         known[1] if known else "换一个录像目录。", "storage")]
+    free = shutil.disk_usage(str(out_root)).free
+    hours = free / (MB_PER_S_DEFAULT * 1e6) / 3600
+    text = "剩余 {:.0f} GB，按默认设置约可录 {:.1f} 小时".format(free / 1e9, hours)
+    if free < 5e9:
+        return [_finding("bad", "磁盘快满了：" + text, str(out_root), "在「回放」里删掉不要的录制，或换录像目录。", "storage")]
+    if free < 30e9:
+        return [_finding("warn", "磁盘空间不多：" + text, str(out_root), "长时间录制前先清理空间。", "storage")]
+    return [_finding("ok", text, str(out_root), key="storage")]
+
+
+def check_previous_hang(log_dir: Path) -> List[Dict[str, str]]:
+    """Read before this process opens the camera: every start rewrites the file."""
+    stacks = log_dir / "start_hang_stacks.txt"
+    try:
+        if stacks.stat().st_mtime < time.time() - 24 * 3600:
+            return []
+        text = stacks.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if "Timeout (" not in text:
+        return []
+    return [_finding("warn", "之前有一次打开相机时 SDK 卡住了", "程序已经自动退出并重新启动。",
+                     KNOWN_PROBLEMS[4][2], "hang")]
+
+
+def check_service_mac() -> List[Dict[str, str]]:
+    """The launchd job, seen from outside (doctor in a terminal)."""
+    plist = Path("/Library/LaunchDaemons/{}.plist".format(SERVICE_LABEL))
+    if sys.platform != "darwin" or not plist.is_file():
+        return [_finding("info", "没有装成后台服务", "用 studio.sh 在终端里启动，或者 bash install_service.sh 安装。", key="service")] \
+            if sys.platform == "darwin" else []
+    text = _run(["launchctl", "print", "system/" + SERVICE_LABEL])
+    if not text:
+        return [_finding("bad", "后台服务已安装但没有加载", "可能被 bash install_service.sh stop 关掉了，或者在「登录项」里被关闭了后台运行。",
+                         "运行 bash install_service.sh start；还不行就到 系统设置 > 通用 > 登录项与扩展，在「允许在后台」里打开 python3.12 / D455。",
+                         "service")]
+    state = re.search(r"^\s*state = (.+)$", text, re.MULTILINE)
+    pid = re.search(r"^\s*pid = (\d+)", text, re.MULTILINE)
+    running = pid is not None
+    detail = "正在运行（进程 {}）".format(pid.group(1)) if running else "现在没有运行，打开网页时会自动启动"
+    return [_finding("ok", "后台服务已安装（按需启动）", detail + ("；launchd 状态：" + state.group(1) if state and not running else ""),
+                     key="service")]
+
+
+def check_port(port: int) -> List[Dict[str, str]]:
+    import socket
+    with socket.socket() as probe:
+        probe.settimeout(1.0)
+        busy = probe.connect_ex(("127.0.0.1", port)) == 0
+    if not busy:
+        return [_finding("ok", "端口 {} 空闲".format(port), key="port")]
+    owner = _run(["lsof", "-nP", "-iTCP:{}".format(port), "-sTCP:LISTEN"]).strip().splitlines()[1:2]
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:{}/api/ping".format(port), timeout=10) as response:
+            ours = b"version" in response.read()
+    except Exception:
+        ours = False
+    if ours:
+        return [_finding("ok", "D455 Studio 在端口 {} 上回应".format(port), key="port")]
+    return [_finding("bad", "端口 {} 被别的程序占着".format(port), " ".join(owner) or "lsof 看不到占用者（可能需要管理员权限）",
+                     "关掉那个程序，或者换端口：bash install_service.sh --port 8456", "port")]
+
+
+def scan_log(path: Path, lines: int = 400) -> List[Dict[str, str]]:
+    """Known problems in the last lines of a log, newest first, each reported once."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 200_000))
+            text = handle.read().decode("utf-8", "replace").splitlines()[-lines:]
+    except OSError:
+        return []
+    seen, found = set(), []
+    for line in reversed(text):
+        known = explain(line)
+        if known and known[0] not in seen:
+            seen.add(known[0])
+            found.append(_finding("warn", "日志里有：" + known[0], line.strip()[:240], known[1], "log:" + known[0]))
+    return found[:4]
+
+
+def self_check(camera: Optional["LiveCamera"], out_root: Path, log_dir: Path,
+               rs: Any = None, port: int = 0, outside: bool = False) -> List[Dict[str, str]]:
+    findings: List[Dict[str, str]] = []
+    for step in (check_system, lambda: check_python(rs if rs is not None else (camera.rs if camera else None)),
+                 lambda: check_guard(bool(camera and camera.service)), lambda: check_usb(camera),
+                 lambda: check_camera(camera), lambda: check_storage(out_root),
+                 lambda: camera.startup_findings if camera is not None else check_previous_hang(log_dir)):
+        try:
+            findings.extend(step())
+        except Exception as error:
+            findings.append(_finding("info", "有一项检查没做完", "{}: {}".format(type(error).__name__, error)))
+    if outside:  # a terminal next to the service: also the service itself, the port and its log
+        for step in (check_service_mac, lambda: check_port(port),
+                     lambda: scan_log(SERVICE_LOG) if SERVICE_LOG.is_file() else []):
+            try:
+                findings.extend(step())
+            except Exception as error:
+                findings.append(_finding("info", "有一项检查没做完", "{}: {}".format(type(error).__name__, error)))
+    return findings
+
+
+def print_findings(findings: List[Dict[str, str]]) -> int:
+    marks = {"ok": "✓", "info": "·", "warn": "!", "bad": "✗"}
+    for item in findings:
+        print("{} {}".format(marks.get(item["level"], "?"), item["title"]))
+        if item["detail"] and item["level"] != "ok":
+            print("    原因：" + item["detail"])
+        if item["fix"] and item["level"] != "ok":
+            print("    办法：" + item["fix"])
+    bad = [item for item in findings if item["level"] == "bad"]
+    warn = [item for item in findings if item["level"] == "warn"]
+    print()
+    print("结论：" + ("有 {} 个问题必须先解决（上面标 ✗ 的）".format(len(bad)) if bad else
+                    "可以用，有 {} 个提醒（上面标 ! 的）".format(len(warn)) if warn else "一切正常"))
+    return 1 if bad else 0
+
 
 # --------------------------------------------------------------------------------------------
 # HTTP
@@ -1571,16 +2157,74 @@ def reveal_in_file_manager(path: Path, select: bool = True) -> None:
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
 
+def launchd_socket(name: str) -> Any:
+    """macOS: the listening socket launchd opened for this job (the plist's Sockets entry). launchd keeps it
+    open while the program is not running and starts the program on the first connection."""
+    import ctypes
+    import socket
+
+    system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    activate = system.launch_activate_socket
+    activate.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_int)), ctypes.POINTER(ctypes.c_size_t)]
+    activate.restype = ctypes.c_int
+    fds = ctypes.POINTER(ctypes.c_int)()
+    count = ctypes.c_size_t(0)
+    error = activate(name.encode(), ctypes.byref(fds), ctypes.byref(count))
+    if error:
+        raise OSError(error, "launch_activate_socket({}): {}".format(name, os.strerror(error)))
+    try:
+        numbers = [fds[number] for number in range(count.value)]
+    finally:
+        system.free.argtypes = [ctypes.c_void_p]
+        system.free(fds)
+    if not numbers:
+        raise OSError("launchd passed no socket for {}".format(name))
+    for extra in numbers[1:]:
+        os.close(extra)
+    return socket.socket(fileno=numbers[0])
+
+
 class StudioServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: Tuple[str, int], camera: LiveCamera, library: Library, allowed_hosts: set) -> None:
-        super().__init__(address, StudioHandler)
+    def __init__(self, address: Tuple[str, int], camera: LiveCamera, library: Library, allowed_hosts: set,
+                 listen_socket: Any = None) -> None:
+        super().__init__(address, StudioHandler, bind_and_activate=listen_socket is None)
+        if listen_socket is not None:  # handed over by launchd (or a test): already bound and listening
+            self.socket.close()
+            listen_socket.setblocking(True)
+            self.socket = listen_socket
+            self.server_address = listen_socket.getsockname()[:2]
+            self.server_name, self.server_port = str(self.server_address[0]), int(self.server_address[1])
         self.camera = camera
         self.library = library
         self.allowed_hosts = allowed_hosts
         self.on_restart: Optional[Callable[[], None]] = None
+        self.on_quit: Optional[Callable[[], None]] = None
+        self.activity_lock = threading.Lock()
+        self.active = 0  # requests being answered right now
+        self.last_request = time.monotonic()
+
+    def get_request(self) -> Tuple[Any, Any]:
+        connection, address = self.socket.accept()
+        connection.setblocking(True)  # macOS: an accepted socket inherits the listener's non-blocking flag
+        return connection, address
+
+    def begin_request(self) -> None:
+        with self.activity_lock:
+            self.active += 1
+            self.last_request = time.monotonic()
+
+    def end_request(self) -> None:
+        with self.activity_lock:
+            self.active -= 1
+            self.last_request = time.monotonic()
+
+    def unused_for(self) -> float:
+        """Seconds since the last request, 0 while one is being answered."""
+        with self.activity_lock:
+            return 0.0 if self.active > 0 else time.monotonic() - self.last_request
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -1646,6 +2290,13 @@ class StudioHandler(BaseHTTPRequestHandler):
         self._dispatch(write=True)
 
     def _dispatch(self, write: bool) -> None:
+        self.server.begin_request()
+        try:
+            self._answer(write)
+        finally:
+            self.server.end_request()
+
+    def _answer(self, write: bool) -> None:
         url = urllib.parse.urlparse(self.path)
         query = {key: values[-1] for key, values in urllib.parse.parse_qs(url.query).items()}
         try:
@@ -1659,6 +2310,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 raise ApiError(404, "not found")
         except ApiError as error:
             self._json({"error": str(error)}, error.status)
+        except FileExistsError as error:
+            self._json({"error": str(error)}, 409)
         except (KeyError, FileNotFoundError) as error:
             self._json({"error": str(error).strip("'\"")}, 404)
         except (ValueError, RuntimeError, IndexError) as error:
@@ -1698,6 +2351,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             return self._json(camera.options())
         if parts == ["profiles"]:
             return self._json(camera.profiles())
+        if parts == ["diagnostics"]:
+            stamp, findings = camera.diagnostics
+            if time.monotonic() - stamp > 5.0 or query.get("fresh") == "1":
+                findings = self_check(camera, library.root, camera.log_dir)
+                camera.diagnostics = (time.monotonic(), findings)
+            return self._json({"findings": findings})
         if len(parts) == 2 and parts[0] == "live":
             if parts[1] == "depth_at":
                 return self._json(camera.live_depth_at(float(query.get("x", 0.5)), float(query.get("y", 0.5))))
@@ -1749,7 +2408,38 @@ class StudioHandler(BaseHTTPRequestHandler):
     def _post(self, path: str, query: Dict[str, str]) -> None:
         camera, library = self.server.camera, self.server.library
         parts = [urllib.parse.unquote(part) for part in path.strip("/").split("/")][1:]
+        if parts == ["import", "file"]:  # raw file bytes, not JSON
+            length = int(self.headers.get("Content-Length") or -1)
+            if length < 0:
+                raise ApiError(411, "Content-Length required")
+            try:
+                library.import_file(query.get("name", ""), query.get("path", ""), length, self.rfile,
+                                    float(query.get("mtime", "0") or 0))
+            except Exception:
+                self.close_connection = True  # the rest of the body may still be on the wire
+                raise
+            return self._json({"ok": True})
         body = self._body()
+        if parts == ["sessions", "delete"]:
+            ids = body.get("ids")
+            if not isinstance(ids, list) or not ids:
+                raise ApiError(400, "ids: a list of session ids")
+            return self._json(library.delete([str(item) for item in ids]))
+        if parts == ["import", "begin"]:
+            return self._json(library.import_begin(str(body.get("name", "")), int(body.get("bytes") or 0)))
+        if parts == ["import", "finish"]:
+            return self._json(library.import_finish(str(body.get("name", "")), str(body.get("kind", "folder"))))
+        if parts == ["import", "cancel"]:
+            library.import_cancel(str(body.get("name", "")))
+            return self._json({"ok": True})
+        if parts == ["service", "quit"]:
+            if camera.recorder is not None:
+                raise ApiError(409, "录制中不能关闭，先停止录制")
+            if self.server.on_quit is None:
+                raise ApiError(409, "not available")
+            self._json({"ok": True, "service": camera.service})
+            threading.Timer(0.3, self.server.on_quit).start()
+            return None
         if parts == ["record", "start"]:
             settings = camera.settings
             changes = {key: body[key] for key in ("scene", "duration") if key in body}
@@ -1787,7 +2477,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             if camera.recorder is not None:
                 raise ApiError(409, "录制中不能重启服务，先停止录制")
             self._json({"ok": True})
-            threading.Timer(0.3, self.server.on_restart).start()  # launchd starts it again (KeepAlive)
+            threading.Timer(0.3, self.server.on_restart).start()  # launchd starts it again on the next request
             return None
         if parts == ["reveal-root"]:
             library.root.mkdir(parents=True, exist_ok=True)
@@ -1796,6 +2486,11 @@ class StudioHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "sessions":
             session_id, action = parts[1], parts[2]
             directory = library.directory(session_id)
+            if action == "delete":
+                result = library.delete([session_id])
+                if result["failed"]:
+                    raise ApiError(409, result["failed"][0]["error"])
+                return self._json(result)
             if action == "reveal":
                 reveal_in_file_manager(directory)
                 return self._json({"ok": True})
@@ -1832,12 +2527,37 @@ def build_parser() -> argparse.ArgumentParser:
                         help="pause the camera after this many seconds without a live view (0: never; default %(default)s)")
     parser.add_argument("--log-dir", default="logs",
                         help="folder for start-hang reports (default ./logs, same as record_d455.py)")
+    parser.add_argument("--exit-after", type=float, default=0.0,
+                        help="exit after this many seconds without any page open and nothing recording "
+                             "(0: never, the default; the macOS service uses {:.0f})".format(EXIT_AFTER_S))
+    parser.add_argument("--doctor", action="store_true",
+                        help="check this computer, the camera connection and the service, explain problems, and exit")
     parser.add_argument("--service", action="store_true", help=argparse.SUPPRESS)  # set by install_service.sh
+    parser.add_argument("--launchd-socket", default="", help=argparse.SUPPRESS)  # the plist's Sockets name
+    parser.add_argument("--listen-fd", type=int, default=-1, help=argparse.SUPPRESS)  # tests: an open listener
     parser.add_argument("--no-sudo", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-usb-hold", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version="d455_studio.py {} (record_d455.py {})".format(
         __version__, rd.__version__))
     return parser
+
+
+def doctor(args: argparse.Namespace) -> int:
+    """`--doctor`: the self check in a terminal, without opening the camera (safe next to a running service)."""
+    print("D455 Studio {} 自检".format(__version__))
+    print()
+    rs = None
+    try:
+        rd.check_dependencies()
+        rs = rd.import_realsense()
+    except BaseException as error:  # import_realsense ends with SystemExit when the SDK is missing
+        print("（导入 SDK 失败：{}）".format(error))
+    out_root = Path(args.sessions).expanduser()
+    if not out_root.is_absolute():
+        out_root = HERE / out_root
+    log_dir = Path(args.log_dir)
+    log_dir = log_dir if log_dir.is_absolute() else HERE / log_dir
+    return print_findings(self_check(None, out_root, log_dir, rs=rs, port=args.port, outside=True))
 
 
 def open_browser(url: str) -> None:
@@ -1858,6 +2578,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
     args = build_parser().parse_args(argv)
     os.chdir(str(HERE))
+    if args.doctor:
+        return doctor(args)
     rd.check_dependencies()
     rs = rd.import_realsense()
     if rd.__version__ != BUILT_AGAINST:
@@ -1878,8 +2600,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     camera = LiveCamera(rs, settings, out_root, serial=args.serial, simulate=args.simulate,
                         log_dir=log_dir if log_dir.is_absolute() else HERE / log_dir, idle_after=args.idle_after)
     library = Library(out_root, camera)
+    library.clean_imports()
     camera.library = library
+    camera.startup_findings = check_previous_hang(camera.log_dir)
     camera.service = bool(args.service)
+    camera.exit_after = max(0.0, float(args.exit_after))
     port = args.port
     allowed = {"127.0.0.1:{}".format(port), "localhost:{}".format(port), "[::1]:{}".format(port)}
     if args.host not in ("127.0.0.1", "localhost"):
@@ -1893,8 +2618,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.host == "0.0.0.0":
             rd.log("WARNING: listening on all network interfaces; anyone on this network can control the camera.")
             allowed = None  # type: ignore[assignment]
+    listener = None
     try:
-        server = StudioServer((args.host, port), camera, library, allowed or _AnyHost())
+        if args.launchd_socket:
+            listener = launchd_socket(args.launchd_socket)
+        elif args.listen_fd >= 0:
+            import socket
+            listener = socket.socket(fileno=args.listen_fd)
+    except OSError as error:
+        rd.log("Cannot take over the listening socket from launchd: {}".format(error))
+        return 1
+    try:
+        server = StudioServer((args.host, port), camera, library, allowed or _AnyHost(), listen_socket=listener)
     except OSError as error:
         rd.log("Cannot listen on port {} ({}). Is D455 Studio already running? Open http://127.0.0.1:{}/".format(
             port, error, port))
@@ -1911,16 +2646,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     def restart_service() -> None:
-        """Exit so launchd's KeepAlive starts a fresh process; also the way out of an SDK call that never
-        returns, hence the hard deadline."""
+        """Exit; launchd starts a fresh process on the page's next request. Also the way out of an SDK call
+        that never returns, hence the hard deadline."""
         rd.log("Restart requested from the page.")
         deadline = threading.Timer(10.0, os._exit, args=(0,))
         deadline.daemon = True
         deadline.start()
         handle_signal(0, None)
 
+    def quit_program(reason: str = "Closed from the page.") -> None:
+        rd.log(reason + (" Opening the page starts it again." if args.launchd_socket else ""))
+        deadline = threading.Timer(10.0, os._exit, args=(0,))
+        deadline.daemon = True
+        deadline.start()
+        handle_signal(0, None)
+
+    def exit_when_unused(limit: float) -> None:
+        """The service's way of using nothing while nobody needs it: launchd keeps the port open and starts
+        the program again on the next request."""
+        while not stopping.wait(5.0):
+            if camera.recorder is not None or library.busy():
+                continue
+            quiet = server.unused_for()
+            if quiet >= limit:
+                quit_program("No page open for {:.0f} s and nothing recording: exiting, which frees the camera "
+                             "and the memory.".format(quiet))
+                return
+
     if args.service:
         server.on_restart = restart_service
+    server.on_quit = quit_program
+    if args.exit_after > 0:
+        threading.Thread(target=exit_when_unused, args=(args.exit_after,), name="exit-when-unused", daemon=True).start()
 
     for name in ("SIGINT", "SIGTERM"):
         try:
