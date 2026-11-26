@@ -8,6 +8,32 @@ bash run.sh
 
 按 `Ctrl+C` 结束。结束时自动生成一份体检报告，告诉你丢了多少帧、三路数据的时间差是多少。
 
+## 网页界面 D455 Studio
+
+不想敲命令时用这个：实时看彩色、深度、红外三路画面，在网页上开始和停止录制、调相机参数，回放录过的 session（三路按时间同步像视频一样播放，可以拖时间轴、逐帧看、把鼠标放在深度图上读距离）。
+
+```
+bash studio.sh
+```
+
+浏览器会自动打开 http://127.0.0.1:8455/ 。Windows 上双击 `studio.bat`。没有相机时可以先用 `bash studio.sh --simulate` 看看界面。
+
+**Mac 上以后不再输密码**：`studio.sh` 每次启动都要输一次密码（相机需要管理员权限）。运行一次下面这条，以后就不用了：
+
+```
+bash install_service.sh
+```
+
+它只在安装时要一次密码，装好后开机自动在后台运行，直接打开 http://127.0.0.1:8455/ 就能看和录。需要知道的几点：
+
+- 录制保存到 `~/D455/sessions`。macOS 不允许后台服务写入桌面、文稿、下载和外接盘，所以不能再存到 Downloads 下的这个文件夹；以前录的留在原处，命令行照常能读。想换位置：`bash install_service.sh --sessions 其他文件夹`。
+- 服务的程序、它自带的 Python 和依赖装在 `/Library/D455Studio`，归管理员所有，你的账户改不了。原因是这些代码以管理员权限运行，如果普通账户能改，任何以你身份运行的程序都能借它拿到管理员权限。
+- 网页只有这台 Mac 自己能打开（127.0.0.1），局域网里的其他电脑连不上。
+- 一分钟没人看实时画面、也没在录制时，相机自动暂停出图（红外投射器也随之关闭）；回到实时页，几秒后恢复。
+- 服务开着时相机归它用。要用 `bash run.sh` 在命令行录制，先 `bash install_service.sh stop`。`status` 看状态，`logs` 看日志，`uninstall` 卸载（录制数据保留）。
+
+网页录出来的 session 和命令行录的完全一样（同一套写盘和体检代码），`verify`、`repair`、`export` 照常可用；没有正常结束的 session 在回放页会提示，一键修复。
+
 ## 先说清楚：哪些验证过，哪些没有
 
 | 项目 | 状态 |
@@ -17,6 +43,7 @@ bash run.sh
 | Ctrl+C、强杀进程后恢复、相机断流、启动失败重试、磁盘写不过来 | 已用模拟相机逐项测试 |
 | Mac 上安装 | 2026-11-26 在 macOS 27.2.1 + Apple 芯片上装好，`pyrealsense2-macosx` 2.56.5 |
 | 真实 D455 接在 Mac 上录制 | **还没有录成**。USB 3 线、IMU 防护、USB 占用都已在 Mac 上验证，`diagnose` 三路都出帧；录制在三路开起来之后卡死，原因已查明（见下表"录制卡在相机信息那几行"），1.2.8 已绕开，待在 Mac 上验证 |
+| 网页界面 D455 Studio | 用模拟相机跑通实时预览、录制、调参、回放、强杀后修复；真实相机和 Mac 后台服务待在 Mac 上验证 |
 
 Mac 是 RealSense 官方支持最弱的平台。官方安装文档原话是 "macOS support for the full range of functionality offered by the SDK is not yet complete"。2026-11-26 在 Mac 上实际遇到的问题和脚本的对应处理：
 
@@ -255,3 +282,6 @@ for item in session.aligned_frames():            # 每个深度帧一组
 | `run.sh` / `run.bat` | 一键启动，首次运行自动装环境 |
 | `requirements.txt` | 依赖列表 |
 | `read_session_example.py` | 读取对齐帧的最小示例 |
+| `d455_studio.py` + `studio/` | 网页界面：本机网页服务（只用 Python 标准库）和页面 |
+| `studio.sh` / `studio.bat` | 启动网页界面 |
+| `install_service.sh` | macOS：把网页界面装成开机自启的后台服务，以后录制不用输密码 |

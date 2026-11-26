@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>D455 Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%2315171d'/%3E%3Ccircle cx='16' cy='16' r='7' fill='%23ff453a'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><span class="mark"></span><span class="name">D455 Studio</span> <small id="version"></small></div>
+    <nav class="tabs" role="tablist">
+      <button data-tab="live" class="active" role="tab"><span class="rec-dot" id="tab-rec" hidden></span>实时</button>
+      <button data-tab="library" role="tab">回放</button>
+    </nav>
+    <div class="device">
+      <div class="pill" id="device-pill"><span class="dot busy" id="device-dot"></span><span id="device-text">正在连接…</span></div>
+      <button class="icon-btn" id="open-settings" title="设置"></button>
+    </div>
+  </header>
+
+  <main>
+    <!-- live -->
+    <section class="view active" id="view-live">
+      <div class="stage" id="live-stage" data-layout="main"></div>
+      <div class="dock">
+        <div class="left">
+          <div class="field w-loc"><label for="scene-location">地点</label><input id="scene-location" placeholder="例如 3F 走廊" maxlength="200"></div>
+          <div class="field grow"><label for="scene-notes">备注</label><input id="scene-notes" placeholder="相机高度、朝向、参与人数…" maxlength="400"></div>
+          <div class="field w-timer"><label for="rec-duration">定时</label>
+            <select id="rec-duration">
+              <option value="0">不限</option>
+              <option value="30">30 秒</option>
+              <option value="60">1 分钟</option>
+              <option value="300">5 分钟</option>
+              <option value="600">10 分钟</option>
+              <option value="1800">30 分钟</option>
+              <option value="3600">1 小时</option>
+            </select>
+          </div>
+        </div>
+        <div class="record">
+          <button class="rec-btn" id="rec-btn" title="开始录制" disabled></button>
+          <div class="rec-time"><span class="clock" id="rec-clock">00:00:00</span><span class="hint" id="rec-hint">相机就绪后可录制</span></div>
+        </div>
+        <div class="stats" id="live-stats"></div>
+      </div>
+    </section>
+
+    <!-- library -->
+    <section class="view" id="view-library">
+      <aside class="sidebar">
+        <div class="head">
+          <div class="title"><h2>录制记录<span id="session-count"></span></h2><button class="icon-btn" id="refresh-list" title="刷新"></button></div>
+          <label class="search"><span id="search-icon"></span><input id="search" placeholder="搜索地点、备注、序列号" autocomplete="off"></label>
+        </div>
+        <div class="sessions" id="session-list"></div>
+      </aside>
+      <div class="player" id="player">
+        <div class="welcome" id="player-welcome">从左侧选择一次录制</div>
+        <div class="player-head" id="player-head" hidden>
+          <div class="ttl"><div class="t1"><span id="player-title"></span><span class="tag" id="player-tag"></span></div><div class="t2" id="player-sub"></div></div>
+          <div class="acts">
+            <button class="btn ghost small" id="player-reveal"></button>
+            <button class="btn small" id="player-info"></button>
+          </div>
+        </div>
+        <div class="banner" id="player-banner" hidden><span id="player-banner-text"></span><button class="btn small" id="player-repair">修复</button></div>
+        <div class="stage" id="play-stage" data-layout="main" hidden></div>
+        <div class="transport" id="transport" hidden>
+          <div class="controls">
+            <button class="icon-btn" id="step-back" title="上一帧（←）"></button>
+            <button class="play" id="play-btn" title="播放 / 暂停（空格）"></button>
+            <button class="icon-btn" id="step-fwd" title="下一帧（→）"></button>
+            <span class="time"><span id="t-now">00:00.000</span> <span class="total">/ <span id="t-total">00:00.000</span></span></span>
+            <span class="frame" id="frame-no"></span>
+            <span class="spacer"></span>
+            <div class="seg" id="speed">
+              <button data-speed="0.25">0.25×</button><button data-speed="0.5">0.5×</button><button data-speed="1" class="active">1×</button><button data-speed="2">2×</button><button data-speed="4">4×</button>
+            </div>
+            <button class="icon-btn" id="play-layout" title="切换布局（L）"></button>
+          </div>
+          <div class="tl-grid" id="tl-grid">
+            <span></span>
+            <div class="timeline" id="timeline">
+              <div class="track"></div><div class="fill" id="tl-fill"></div><div class="knob" id="tl-knob"></div>
+              <div class="hover" id="tl-hover" hidden></div>
+            </div>
+            <span></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+
+<aside class="drawer" id="settings">
+  <header><h2>设置</h2><button class="icon-btn" data-close></button></header>
+  <div class="body">
+    <div class="section" id="sec-options">
+      <h3>相机参数 <span class="seg" id="opt-role"><button data-role="depth" class="active">深度</button><button data-role="color">彩色</button></span></h3>
+      <p class="note">立即生效，下次打开相机时沿用。</p>
+      <div id="opt-rows"></div>
+      <div class="actions"><button class="btn ghost small" id="opt-reset">恢复默认</button></div>
+    </div>
+    <div class="section">
+      <h3>视频流</h3>
+      <p class="note" id="stream-note">修改后相机会重新打开，约几秒。</p>
+      <div class="row"><label>录制画面</label><div class="ctl start"><div class="chips" id="stream-chips"></div></div></div>
+      <div class="row"><label>深度 / 红外</label><div class="ctl"><select id="depth-size"></select></div></div>
+      <div class="row"><label>彩色</label><div class="ctl"><select id="color-size"></select></div></div>
+      <div class="row"><label>帧率</label><div class="ctl"><select id="fps"></select></div></div>
+      <div class="actions"><button class="btn primary small" id="apply-streams" disabled>应用</button></div>
+    </div>
+    <div class="section">
+      <h3>存储</h3>
+      <div class="row"><label>彩色</label><div class="ctl"><span class="seg" id="color-codec"><button data-v="jpeg">JPEG</button><button data-v="png">PNG 无损</button></span></div></div>
+      <div class="row"><label>红外</label><div class="ctl"><span class="seg" id="ir-codec"><button data-v="jpeg">JPEG</button><button data-v="png">PNG 无损</button></span></div></div>
+      <div class="row"><label>JPEG 质量</label><div class="ctl"><input type="range" id="jpeg-quality" min="70" max="100" step="1"><input type="number" id="jpeg-quality-n" min="70" max="100"></div></div>
+      <div class="row"><label>分段</label><div class="ctl"><select id="split-minutes">
+        <option value="5">每 5 分钟一个文件</option><option value="10">每 10 分钟一个文件</option><option value="30">每 30 分钟一个文件</option><option value="0">不分段</option>
+      </select></div></div>
+      <div class="row"><label>深度</label><div class="ctl"><span class="muted" style="color:var(--muted)">始终 16 位 PNG，无损</span></div></div>
+      <div class="row"><label>保存到</label><div class="ctl"><button class="btn ghost small" id="reveal-root">在访达中打开</button></div></div>
+      <div class="path" id="root-path"></div>
+    </div>
+    <div class="section">
+      <h3>显示</h3>
+      <p class="note">只影响屏幕上的深度着色，不影响录下的数据。</p>
+      <div class="row"><label>色带</label><div class="ctl"><select id="cmap">
+        <option value="turbo">Turbo</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option><option value="jet">Jet</option><option value="gray">灰度（近亮远暗）</option>
+      </select></div></div>
+      <div class="row"><label>深度范围</label><div class="ctl"><input type="number" id="near" min="0" max="20" step="0.1"><span style="color:var(--muted)">到</span><input type="number" id="far" min="0.2" max="40" step="0.1"><span style="color:var(--muted)">米</span></div></div>
+    </div>
+    <div class="section">
+      <h3>相机</h3>
+      <dl class="kv" id="camera-kv"></dl>
+      <div class="actions"><button class="btn ghost small" id="camera-restart">重新打开相机</button></div>
+    </div>
+    <div class="section">
+      <h3>日志</h3>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</aside>
+
+<aside class="drawer" id="details">
+  <header><h2>录制详情</h2><button class="icon-btn" data-close></button></header>
+  <div class="body" id="details-body"></div>
+</aside>
+
+<div class="toasts" id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -6,6 +6,7 @@ __pycache__/
 # Recorder output: recordings and diagnose reports stay on the recording machine
 sessions/
 logs/
+studio_settings.json
 *.mcap
 *.bag
 
