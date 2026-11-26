@@ -16,7 +16,7 @@ bash run.sh
 | 与现有标注工具兼容 | 已用 `thermal-tof-ZhilinHome` 里的 `session_reader.py` 打开模拟 session，彩色、深度、红外通道和 meta 时间线都能读到 |
 | Ctrl+C、强杀进程后恢复、相机断流、启动失败重试、磁盘写不过来 | 已用模拟相机逐项测试 |
 | Mac 上安装 | 2026-11-26 在 macOS 27.2.1 + Apple 芯片上装好，`pyrealsense2-macosx` 2.56.5 |
-| 真实 D455 接在 Mac 上录制 | **还没有录成**。换了 USB 3 线后相机稳定连在 5 Gb/s；SDK 随后在打开 IMU 接口时崩溃（见下表第二行），1.2.2 加了防护，待在 Mac 上验证 |
+| 真实 D455 接在 Mac 上录制 | **还没有录成**。USB 3 线、IMU 防护、USB 占用都已在 Mac 上验证，`diagnose` 三路都出帧；录制在三路开起来之后卡死，原因已查明（见下表"录制卡在相机信息那几行"），1.2.8 已绕开，待在 Mac 上验证 |
 
 Mac 是 RealSense 官方支持最弱的平台。官方安装文档原话是 "macOS support for the full range of functionality offered by the SDK is not yet complete"。2026-11-26 在 Mac 上实际遇到的问题和脚本的对应处理：
 
@@ -26,6 +26,7 @@ Mac 是 RealSense 官方支持最弱的平台。官方安装文档原话是 "mac
 | SDK 一列出相机就崩溃（`IOHIDDeviceOpen`，访问地址 0x30），线和连接都正常时也每次复现 | SDK 自带的 hidapi（`hid_open_path`）在 macOS 给不出 IMU 的 HID 句柄时，仍拿空句柄去调用 `IOHIDDeviceOpen`。社区版 2.54.2 和 2.56.5 是同一段代码，换版本没用；相机掉线重连的瞬间也会走到这里 | 脚本在 Mac 上编译一个几十行的防护库 `.venv/hid_guard_arm64.dylib`，以管理员权限重启时注入进程，把这次空句柄调用改成返回错误。结果是 IMU 不可用，深度、彩色、红外不受影响。编译需要 Xcode 命令行工具。另外仍会先等 macOS 稳定识别相机 3 秒，再让 SDK 接触它 |
 | 彩色时有时无：同一种打开顺序这次三路都出帧，下次 0 帧；只开彩色总是 0 帧；偶尔在 `libusb_get_device_list` 里崩溃 | SDK 每释放一个 USB 接口，它内置的 libusb 就可能把整台相机交还给 macOS（重新枚举），系统摄像头服务 UVCAssistant 随即抢回彩色接口，SDK 手里其余通道失效（`pipe ref not recognized`）。libusb 在 macOS 上按整台设备计数，接管和交还的次数对不上 | 1.2.4 起，录制开始前脚本先用同一份 libusb 把相机整体接管一次，并把计数抬到 SDK 在一次录制里放不完的高度，录制期间不再交还。录制开头会打印一行 `USB hold: active`。实测（2026-11-26 21:32）交还次数为 0，没有再崩溃。接管后系统不会自动收回相机，拔插一次才会还给 macOS |
 | 相机刚从系统手里接管过来时，第一次打开彩色收不到帧（深度和红外正常） | 系统摄像头服务留下的状态，具体原因未查明。第二次打开就正常，之后在同一次插入期间都正常 | 1.2.5 起，开始录制时脚本先确认每一路都出了第一帧（这段不写盘），有一路 5 秒内没出就全部停下重开，最多 3 次；仍不行就按 `--start-retries` 从头重试，第 2 次起会给相机发硬件复位。终端里会看到一行 `no data from color ... starting all streams again`，属于正常 |
+| 录制卡在相机信息那几行，三路已经开起来，之后既不写盘也不能 Ctrl+C | SDK 2.56.5 的缺陷，只在 macOS 上出现：Python 调 `get_supported_options()`（列出传感器支持哪些参数）时，SDK 给相机接口的供电计数加一次、减两次。正在出帧的传感器计数被减到 0，SDK 就去关这个接口；关闭要等帧回调结束，帧回调要等 Python 锁，而锁在调用方手里，形成死锁。Linux 和 Windows 上不会发生，Intel 的最新源码已经修掉 | 1.2.8 起不再调用这个函数，改为逐个询问 `supports()` 再读值，这条路径的计数是平衡的 |
 | `selftest` 崩溃（malloc double free） | 社区版 SDK 2.56.5 的模拟相机注入帧时内部出错，40 行的最小程序也能复现 | Mac 上的自测改用 Python 生成的模拟帧，录制、编码、写盘、读回、对齐分析走的是同一套代码 |
 
 如果防护库在 Mac 上也挡不住，剩下两条路：在 Mac 上从源码编译一份修好这处的 SDK，或者用一台 Windows / Ubuntu 电脑录，脚本和数据格式完全一样。
@@ -219,6 +220,8 @@ for item in session.aligned_frames():            # 每个深度帧一组
 **显示 USB 2.x 或 480 Mb/s。** 线或口不支持 USB 3。很多 USB-C 充电线只有 USB 2 数据能力。USB-C 插头正反插有时结果不同，可以翻面试一次。
 
 **诊断报告里写着 `IMU crash guard: NOT active`。** 后面会跟原因。最常见的是没装 Xcode 命令行工具，运行一次 `xcode-select --install` 再重跑 `bash run.sh diagnose`。如果写的是 `injected but did not load`，说明这个 Python 不接受注入，把报告发给我。设置环境变量 `D455_NO_HID_GUARD=1` 可以关掉防护，用于对比测试。
+
+**录制停在相机信息那几行不动。** 1.2.8 修掉了已知的原因（见上面 Mac 问题表）。如果还会发生：什么都不用做，等它自己结束。1.2.7 起，启动 40 秒还没完成时，脚本会自动给 SDK 内部拍一张快照（`sessions/<session>/derived/start_hang_sample.txt`，仅 macOS），并把各线程当时在做什么写进同一目录的 `start_hang_stacks.txt`；150 秒时脚本自己退出。这几步都不依赖 Python 主线程，所以 SDK 卡死在底层时也能完成。终端里可能看到一行 `starting the camera has not finished`，也可能什么都没有，两种情况都会留下文件。之后拔插一次相机再重跑，并把这两个文件发给我。
 
 **录制或诊断时打印 `USB hold: NOT active`。** 后面会跟原因。`it needs administrator rights` 说明没有通过 `run.sh` 运行；`macOS did not hand the camera over` 时先退出所有可能用摄像头的程序再试。接管不成功时脚本照常继续，只是彩色可能时有时无。加 `--no-usb-hold` 可以关掉接管，用于对比测试。
 
