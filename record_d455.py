@@ -75,7 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__version__ = "1.2.9"
+__version__ = "1.2.10"
 FORMAT_NAME = "realsense-mcap-session"
 FORMAT_VERSION = 1
 HW_CLOCK_WRAP_US = 1 << 32  # the D400 device clock is a 32-bit microsecond counter (~71.6 min)
@@ -298,13 +298,23 @@ def hand_back_ownership(path: Path, recursive: bool = True) -> None:
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if not uid or not hasattr(os, "chown") or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return
+    # Never through a symbolic link: this runs as root on folders the user controls, and a link planted there
+    # would otherwise hand the user whatever it points to (for example the root-owned program folder).
     try:
         owner, group = int(uid), int(gid) if gid else -1
-        os.chown(str(path), owner, group)
-        if recursive:
-            for root, directories, files in os.walk(str(path)):
+        top = str(path)
+        if os.path.islink(top):
+            return
+        os.chown(top, owner, group, follow_symlinks=False)
+        if recursive and hasattr(os, "fwalk"):
+            # fwalk works on directory handles and checks each one against its lstat, so a folder swapped
+            # for a link while we walk is not entered either
+            for _folder, directories, files, folder_fd in os.fwalk(top, follow_symlinks=False):
                 for name in directories + files:
-                    os.chown(os.path.join(root, name), owner, group)
+                    try:
+                        os.chown(name, owner, group, dir_fd=folder_fd, follow_symlinks=False)
+                    except OSError:
+                        pass
     except Exception:
         pass
 
@@ -1686,11 +1696,32 @@ def is_finalized(path: Path) -> bool:
 
 def repair_recording(path: Path, session_id: str, index: int, static_info: Dict[str, Any]) -> int:
     """Rewrite an MCAP file that was never finalized (crash, kill, power loss) into an indexed one.
-    Every complete message is kept. Returns the number of messages."""
+    Every complete message is kept. Returns the number of messages. The original is replaced only after the
+    copy is complete; on any read or write error it stays as it was and the partial copy is removed."""
+    temporary = path.with_name(path.name + ".repair")
+    size = path.stat().st_size
+    free = shutil.disk_usage(str(path.parent)).free
+    if free < size + 1e9:  # the copy is about as large as the file; a full disk is a common reason for the crash
+        raise RuntimeError("not enough free space to repair {}: needs about {:.1f} GB, {:.1f} GB free. Free some "
+                           "space (or copy the session to a bigger disk) and repair again.".format(
+                               path.name, (size + 1e9) / 1e9, free / 1e9))
+    count = 0
+    try:
+        count = _copy_messages(path, temporary, session_id, index, static_info)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()  # never leave a half copy behind (it may be gigabytes)
+        except OSError:
+            pass
+        raise
+    return count
+
+
+def _copy_messages(path: Path, temporary: Path, session_id: str, index: int, static_info: Dict[str, Any]) -> int:
     from mcap.reader import NonSeekingReader
     from mcap.writer import CompressionType, Writer
 
-    temporary = path.with_name(path.name + ".repair")
     count = 0
     with open(path, "rb") as source, open(temporary, "wb") as target:
         writer = Writer(target, chunk_size=4 * 1024 * 1024, compression=CompressionType.NONE)
@@ -1713,10 +1744,11 @@ def repair_recording(path: Path, session_id: str, index: int, static_info: Dict[
                 writer.add_message(channel_id=channel_ids[channel.id], log_time=message.log_time, data=message.data,
                                    publish_time=message.publish_time, sequence=message.sequence)
                 count += 1
+        except OSError:
+            raise  # a read or write error (bad disk, disk full) is not the end of the data: keep the original
         except Exception:
-            pass  # the torn tail of the file
+            pass  # the torn tail of the file (the MCAP reader's own errors: cut record, bad length, ...)
         writer.finish()
-    os.replace(temporary, path)
     return count
 
 
@@ -3097,7 +3129,8 @@ class MacUsbHold:
 
     The hold loads the same libusb the SDK uses (one copy per process, so the counter is shared), opens the
     camera, takes it over once and raises the counter far above anything the SDK releases. The counter never
-    reaches zero, so nothing is handed back until this process exits; then macOS gets the camera back.
+    reaches zero, so nothing is handed back while this process runs. macOS does not take the camera back
+    when the process exits either (seen 2026-11-26: all interfaces stay without a driver until a replug).
     The hold's context also keeps libusb's macOS backend alive between the SDK's short-lived contexts, which
     otherwise tear it down and build it again on every device poll."""
 
@@ -3714,12 +3747,21 @@ def command_repair(args: argparse.Namespace) -> int:
         manifest = session.manifest
         static_info = {key: manifest[key] for key in STATIC_INFO_KEYS if key in manifest}
         static_info.setdefault("device_id", session.device_id)
+        failed = False
         for index, recording in enumerate(session.recordings):
             if is_finalized(recording):
                 continue
             log("{}: rewriting the unfinalized file {} ...".format(directory.name, recording.name))
-            count = repair_recording(recording, manifest.get("session_id", directory.name), index, static_info)
+            try:
+                count = repair_recording(recording, manifest.get("session_id", directory.name), index, static_info)
+            except (OSError, RuntimeError) as error:
+                log("  NOT repaired, the file is unchanged: {}".format(error))
+                failed = True
+                break
             log("  kept {} messages".format(count))
+        if failed:  # leave the session as it is (still marked unfinished) so it can be repaired again
+            worst = 1
+            continue
         session.rebuild_index()
         nominal = {name: entry.get("fps", 0) for name, entry in (manifest.get("streams") or {}).items()}
         report = analyze_session(directory, nominal=nominal or None)

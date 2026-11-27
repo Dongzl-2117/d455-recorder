@@ -8,6 +8,67 @@ bash run.sh
 
 按 `Ctrl+C` 结束。结束时自动生成一份体检报告，告诉你丢了多少帧、三路数据的时间差是多少。
 
+## 网页界面 D455 Studio
+
+不想敲命令时用这个：实时看彩色、深度、红外三路画面，在网页上开始和停止录制、调相机参数，回放录过的 session（三路按时间同步像视频一样播放，可以拖时间轴、逐帧看、把鼠标放在深度图上读距离）。
+
+### 装到一台新电脑
+
+**Mac**（装一次，以后插上相机、打开网页就能录，不再要密码）：
+
+```
+xcode-select --install       # 只有第一次需要，在弹窗里点"安装"，约 5 分钟
+git clone https://github.com/Dongzl-2117/d455-recorder.git
+cd d455-recorder
+bash install_service.sh      # 先检查这台 Mac，再输一次开机密码，约 2 分钟，装完自动打开网页
+```
+
+安装脚本动手之前先检查：macOS 版本（12 以上）、芯片、终端是否在 Rosetta 下、账户是不是管理员、Xcode 命令行工具、能否访问 pypi.org 和 github.com、磁盘空间、端口 8455、录像目录的位置。有问题会先列出原因和办法，什么都不改动。网络屏蔽 pypi.org 或 github.com 时可以用镜像：`--index-url` 和 `--python-mirror`。
+
+以后直接打开 http://127.0.0.1:8455/ （建议加书签，`~/D455` 里也有一个快捷方式）。更新：在这个文件夹里 `git pull`，再运行一次 `bash install_service.sh`（会再要一次密码，因为服务的程序归管理员所有）。仓库是私有的，对方需要先被加为协作者，或者把整个文件夹拷给他。
+
+**Windows**：装好 Python 3.9 以上（安装时勾选 Add python.exe to PATH），双击 `studio.bat`。第一次会自动装依赖，之后浏览器自动打开网页。Windows 打开相机不需要管理员权限。
+
+**Linux**：`bash studio.sh`。Ubuntu 和 Debian 先装 `sudo apt install python3-venv`。和命令行录制一样，需要先装一次 RealSense 的 udev 规则，普通用户才能打开相机：
+
+```
+sudo curl -fsSL https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules -o /etc/udev/rules.d/99-realsense-libusb.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger     # 然后拔插一次相机
+```
+
+RealSense 的 Python 包只发布了 x86 电脑的版本；树莓派、Jetson 这类 ARM 的 Linux 没有现成的包。安装失败时脚本会说明是版本不对还是网络不通。
+
+不装服务也可以临时用：Mac 上 `bash studio.sh`，每次启动输一次密码。没有相机时 `bash studio.sh --simulate` 可以先看界面。
+
+### 出问题时
+
+- Mac 装了服务的：`bash install_service.sh doctor`
+- 其他情况：`bash studio.sh --doctor`（Windows：`studio.bat --doctor`）
+- 网页里：右上角设置 > 自检。实时页等不到相机超过几秒，也会直接在画面上写出原因。
+
+检查的内容：系统版本和芯片、Python 和 SDK 版本、IMU 崩溃防护、系统自己有没有识别到相机（和 SDK 无关）以及 USB 速度（USB 2 会提示换线）、USB-C 口检测到插头却没有数据连接（充电线）、相机是否被别的程序或 macOS 相机服务占着、固件是否旧于 SDK 推荐、上一次打开相机是否卡死过、磁盘还能录多久、端口是否被占用、后台服务是否被关掉、服务日志里出现过的已知错误。每一条问题都写明原因和办法。
+
+### 看别处拷来的录像，删掉不要的
+
+- 回放页左上角的「导入」：选一个录像文件夹（里面有 `recordings` 的那种，或者装着多个录像的上一级文件夹），或者直接选 `.mcap` 文件；也可以把它们拖到列表上。会复制一份到录像目录，原文件不动。网页是通过浏览器读这些文件的，所以桌面、下载、U 盘里的都能导入，不受 macOS 对后台服务的限制。只复制录像数据（`.mcap`、`.json`、`.csv`、图片等），程序和脚本一类的文件不复制；`derived/export` 里导出的单帧图片也不复制，需要时用 `export` 重新生成。
+- 也可以在访达里直接把录像文件夹或 `.mcap` 文件拷进录像目录（设置 > 存储 > 在访达中打开），刷新列表就出现；放在下一级文件夹里的也认。要直接拷贝，不要放替身（符号链接）：替身不显示，也不会被删除。
+- 没有 `manifest.json` 的单个 `.mcap` 文件，日期和时长从文件本身读出来。
+- 删除：回放页的「选择」可以多选，或者在播放页右上角删当前这个。删除前会列出要删的录像和总大小再确认一次；正在录制的不能删。删除是直接从磁盘删掉，不经过废纸篓（后台服务没有权限使用废纸篓）。
+
+### Mac 后台服务需要知道的几点
+
+- 录制保存到 `~/D455/sessions`。macOS 不允许后台服务写入桌面、文稿和下载，所以不能存到 Downloads 下面；以前录的留在原处，命令行照常能读。换位置：`bash install_service.sh --sessions 其他文件夹`。录到外接盘（`/Volumes/...`）需要在"系统设置 > 隐私与安全性 > 完全磁盘访问权限"里加上服务自带的 Python，安装脚本会打印它的路径。
+- 服务的程序、它自带的 Python 和依赖装在 `/Library/D455Studio`，归管理员所有，你的账户改不了。原因是这些代码以管理员权限运行，如果普通账户能改，任何以你身份运行的程序都能借它拿到管理员权限。
+- 网页只有这台 Mac 自己能打开（127.0.0.1），局域网里的其他电脑连不上。别的网站也调不动它：服务只接受这个网页自己发出的请求。
+- 服务以管理员身份运行，所以录像目录必须是你自己账户下的普通文件夹。如果它或它的上级被换成替身（符号链接），或者不归你所有，服务会停用录制、导入和删除，自检里写明原因。原因是：管理员程序如果跟着替身写文件、改文件归属，以你身份运行的任何程序都能借它改动系统文件。
+- 正在录制时，`stop`、更新（再运行一次 `bash install_service.sh`）和 `uninstall` 会拒绝执行，提示先在网页里停止录制。确实要马上停，加 `--force`，录制会被收尾保存。
+- 服务按需运行：开机后它并不运行，只有 macOS 自带的 launchd 守着 8455 端口。打开网页时才启动（多等两三秒），网页全部关掉 5 分钟后、且没有在录制时自动退出，退出后不占 CPU 和内存。注意：相机被这个服务或 `run.sh` 接管过以后，macOS 不会自己收回，Photo Booth、视频会议这类 Mac 自带的相机应用要等拔插一次相机才能再用它。网页在后台标签页里时不发任何请求，所以忘记关的标签页也不会让它一直运行。设置里的「关闭后台服务」可以马上退出。
+- 网页打开期间：一分钟没人看实时画面、也没在录制时，相机暂停出图（红外投射器也随之关闭），回到实时页几秒后恢复。只看回放时不会去碰相机。相机拔掉再插上会自动重新连接。设置里有"硬件复位"（等于拔插一次）和"重启后台服务"，相机卡住时用。
+- 服务运行时相机归它用。要用 `bash run.sh` 在命令行录制，先在网页设置里点「关闭后台服务」（或者关掉网页等 5 分钟）。`bash install_service.sh stop` 是彻底关掉，重启电脑后也不会再监听端口，`start` 恢复；这两条要输密码。`status` 看状态，`logs` 看日志，`uninstall` 卸载（录制数据保留）。
+- macOS 13 以后，装好时系统可能提示"已添加后台项目"。如果在 系统设置 > 通用 > 登录项与扩展 里把它（显示为 python3.12）关掉，服务就起不来，`doctor` 会提示这一点。
+
+网页录出来的 session 和命令行录的完全一样（同一套写盘和体检代码），`verify`、`repair`、`export` 照常可用；没有正常结束的 session 在回放页会提示，一键修复。
+
 ## 先说清楚：哪些验证过，哪些没有
 
 | 项目 | 状态 |
@@ -17,6 +78,7 @@ bash run.sh
 | Ctrl+C、强杀进程后恢复、相机断流、启动失败重试、磁盘写不过来 | 已用模拟相机逐项测试 |
 | Mac 上安装 | 2026-11-26 在 macOS 27.2.1 + Apple 芯片上装好，`pyrealsense2-macosx` 2.56.5 |
 | 真实 D455 接在 Mac 上录制 | **已录成**（2026-11-26，1.2.8，60 秒）：体检 PASS；深度、彩色、红外都是 29.97 fps，相机端和脚本端丢帧 0；彩色和深度的时间戳差中位数 0.008 ms、最大 1.1 ms，红外和深度为同一时刻 |
+| 网页界面 D455 Studio | 用模拟相机跑通实时预览、录制、调参、回放、导入、删除、强杀后修复、按需启动和自动退出（`tests/`，GitHub 上在 Ubuntu、Windows、macOS 自动跑）；Mac 后台服务真机实测（2026-11-26，macOS 27.2.1）：三路出图时约 10% CPU、130 MB 内存；关网页 5 分钟后自动退出，之后 0 占用；没在运行时打开网页 0.4 秒响应，约 9 秒出图 |
 
 Mac 是 RealSense 官方支持最弱的平台。官方安装文档原话是 "macOS support for the full range of functionality offered by the SDK is not yet complete"。2026-11-26 在 Mac 上实际遇到的问题和脚本的对应处理：
 
@@ -231,7 +293,7 @@ for item in session.aligned_frames():            # 每个深度帧一组
 
 **报告里时间戳域是 `system_time`，结果为 FAIL。** 说明逐帧元数据没有到达 SDK，时间戳退化成了电脑收到数据的时刻，精度只有 USB 抖动水平。Mac 和 Linux 上一般不会出现；Windows 上需要以管理员身份运行一次 `python record_d455.py enable-metadata`，然后重新插拔相机。
 
-**录制中途程序崩溃或电脑断电。** 数据边录边写盘，程序崩溃最多丢最后约 1 秒，断电最多丢最后几秒。下次运行时脚本会提示有未关闭的 session，运行 `bash run.sh repair sessions/<session>` 修复索引并补全报告。
+**录制中途程序崩溃或电脑断电。** 数据边录边写盘，程序崩溃最多丢最后约 1 秒，断电最多丢最后几秒。下次运行时脚本会提示有未关闭的 session，运行 `bash run.sh repair sessions/<session>` 修复索引并补全报告。修复要先写一份和原文件差不多大的副本，所以需要那么多剩余空间（10 分钟一段约 9 GB）；空间不够、或者读写出错时，修复会停下并说明原因，原文件保持不动，可以腾出空间后再修。
 
 **合上笔记本盖子。** 脚本会阻止系统空闲休眠，但合盖仍会休眠并中断录制。长时间录制请保持开盖并接电源。
 
@@ -255,3 +317,8 @@ for item in session.aligned_frames():            # 每个深度帧一组
 | `run.sh` / `run.bat` | 一键启动，首次运行自动装环境 |
 | `requirements.txt` | 依赖列表 |
 | `read_session_example.py` | 读取对齐帧的最小示例 |
+| `d455_studio.py` + `studio/` | 网页界面：本机网页服务（只用 Python 标准库）和页面 |
+| `studio.sh` / `studio.bat` | 启动网页界面 |
+| `install_service.sh` | macOS：把网页界面装成按需启动的后台服务，以后录制不用输密码；`doctor` 排查问题 |
+| `tests/` | 不需要相机的自动测试：`python tests/test_studio.py`（接口和按需启动），`node tests/test_page.js`（浏览器里的网页），`sudo python tests/test_root_safety.py`（服务以管理员身份运行时不跟随替身、不写进别人的文件夹），`python tests/test_repair.py`（修复遇到读写错误或空间不够时原文件不动） |
+| `.github/workflows/test.yml` | 每次推送在 Ubuntu、Windows、macOS 上跑上面的测试，并在一台干净的 Mac 上安装、使用、卸载后台服务 |

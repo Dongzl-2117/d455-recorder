@@ -6,6 +6,7 @@ __pycache__/
 # Recorder output: recordings and diagnose reports stay on the recording machine
 sessions/
 logs/
+studio_settings.json
 *.mcap
 *.bag
 
@@ -15,3 +16,5 @@ logs/
 # OS clutter
 .DS_Store
 Thumbs.db
+tests/screenshots/
+node_modules/

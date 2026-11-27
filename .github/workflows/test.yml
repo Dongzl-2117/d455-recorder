@@ -1,0 +1,127 @@
+# Checks that the recorder and D455 Studio work on clean machines, without a camera:
+#   - simulated recording and the whole Studio API on Ubuntu, Windows and macOS (several Python versions)
+#   - the web page in a real browser (Chromium)
+#   - the macOS service end to end on a fresh Mac: install_service.sh, on-demand start through launchd,
+#     exit when unused, start again on the next request, close from the page, stop / start, uninstall
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  simulated:
+    name: simulated (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12"]
+        include:
+          - { os: ubuntu-24.04, python: "3.10" }  # the oldest Python run.sh users have (Anaconda on the Mac)
+          - { os: ubuntu-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the packages (as run.sh / run.bat do)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt || python -m pip install "pyrealsense2-macosx==2.54.2" numpy opencv-python "mcap>=1.0" "protobuf>=3.20"
+      - name: Launcher creates its own .venv (what a new user runs first)
+        if: runner.os != 'Windows'
+        run: bash run.sh --version
+      - name: Launcher creates its own .venv (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call run.bat --version
+      - name: Recorder self test
+        run: python record_d455.py selftest
+      - name: Studio self check (no camera here, so warnings are expected)
+        run: python d455_studio.py --doctor --sessions ci-sessions
+        continue-on-error: true
+      - name: Repair keeps the original on errors
+        run: python tests/test_repair.py
+      - name: Studio end to end
+        run: python tests/test_studio.py
+      - name: Root safety (links, foreign folders and imports under the root service)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sudo "$(command -v python)" tests/test_root_safety.py
+
+  page:
+    name: web page in Chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: python -m pip install -r requirements.txt
+      - run: npm install --no-save --no-package-lock playwright@1.48.2 && npx playwright install --with-deps chromium
+      - run: node tests/test_page.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: page-screenshots
+          path: tests/screenshots/
+
+  macos-service:
+    name: macOS service on a fresh Mac
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse
+        run: for file in *.sh; do bash -n "$file"; done
+      - name: Install the service (the runner has password-less sudo)
+        run: bash install_service.sh --exit-after 20 --no-browser
+      - name: Service works and runs only on demand
+        run: |
+          set -x
+          B=http://127.0.0.1:8455
+          O='Origin: http://127.0.0.1:8455'
+          pid() { sudo launchctl print system/local.d455studio | awk '/^[[:space:]]*pid = /{print $3}'; }
+          curl -fsS $B/api/ping
+          curl -fsS "$B/api/state" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["camera"]); assert s["camera"]["service"] and s["exit_after"] == 20'
+          curl -fsS "$B/api/diagnostics" | python3 -m json.tool
+          curl -fsS "$B/api/sessions" | python3 -m json.tool
+          test -n "$(pid)"
+          # no requests for a while: the program must exit, launchd keeps the port
+          for i in $(seq 1 30); do [ -z "$(pid)" ] && break; sleep 2; done
+          test -z "$(pid)"
+          sudo lsof -nP -iTCP:8455 -sTCP:LISTEN
+          # the next request starts it again
+          curl -fsS --max-time 60 $B/api/ping
+          test -n "$(pid)"
+          # closed from the page
+          curl -fsS -X POST -H "$O" -H 'Content-Type: application/json' -d '{}' $B/api/service/quit
+          for i in $(seq 1 15); do [ -z "$(pid)" ] && break; sleep 1; done
+          test -z "$(pid)"
+          bash install_service.sh status
+          bash install_service.sh doctor
+          # stop: nothing listens any more; start: back
+          bash install_service.sh stop
+          ! curl -fsS --max-time 3 $B/api/ping
+          bash install_service.sh start --no-browser
+          curl -fsS $B/api/ping
+      - name: Update in place (run the installer again)
+        run: bash install_service.sh --no-browser && curl -fsS http://127.0.0.1:8455/api/ping
+      - name: Uninstall
+        run: |
+          bash install_service.sh uninstall
+          test ! -e /Library/LaunchDaemons/local.d455studio.plist
+          test ! -e /Library/D455Studio
+          ! curl -fsS --max-time 3 http://127.0.0.1:8455/api/ping
+      - name: Service log
+        if: always()
+        run: sudo cat /Library/Logs/D455Studio/studio.log 2>/dev/null || true
