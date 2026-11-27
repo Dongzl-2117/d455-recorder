@@ -25,9 +25,9 @@ bash install_service.sh      # 先检查这台 Mac，再输一次开机密码，
 
 安装脚本动手之前先检查：macOS 版本（12 以上）、芯片、终端是否在 Rosetta 下、账户是不是管理员、Xcode 命令行工具、能否访问 pypi.org 和 github.com、磁盘空间、端口 8455、录像目录的位置。有问题会先列出原因和办法，什么都不改动。网络屏蔽 pypi.org 或 github.com 时可以用镜像：`--index-url` 和 `--python-mirror`。
 
-以后直接打开 http://127.0.0.1:8455/ （建议加书签，`~/D455` 里也有一个快捷方式）。更新：在这个文件夹里 `git pull`，再运行一次 `bash install_service.sh`（会再要一次密码，因为服务的程序归管理员所有）。仓库是私有的，对方需要先被加为协作者，或者把整个文件夹拷给他。
+以后直接打开 http://127.0.0.1:8455/ （建议加书签，`~/D455` 里也有一个快捷方式）。更新：在这个文件夹里 `git pull`，再运行一次 `bash install_service.sh`（会再要一次密码，因为服务的程序归管理员所有）。电脑上没有 git 时，也可以在 https://github.com/Dongzl-2117/d455-recorder 点 Code > Download ZIP，解压后在那个文件夹里运行 `bash install_service.sh`（这样更新时要重新下载）。
 
-**Windows**：装好 Python 3.9 以上（安装时勾选 Add python.exe to PATH），双击 `studio.bat`。第一次会自动装依赖，之后浏览器自动打开网页。Windows 打开相机不需要管理员权限。
+**Windows**：装好 Python 3.12（python.org 下载，安装时勾选 Add python.exe to PATH），用 `git clone` 或 Download ZIP 取得这个文件夹，双击 `studio.bat`。第一次会自动装依赖，之后浏览器自动打开网页。Windows 打开相机不需要管理员权限。
 
 **Linux**：`bash studio.sh`。Ubuntu 和 Debian 先装 `sudo apt install python3-venv`。和命令行录制一样，需要先装一次 RealSense 的 udev 规则，普通用户才能打开相机：
 
