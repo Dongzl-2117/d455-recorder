@@ -6,5 +6,14 @@ rem   studio.bat --doctor     check this computer and the camera connection, exp
 setlocal
 cd /d "%~dp0"
 call run.bat --version
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto failed
 .venv\Scripts\python d455_studio.py %*
+if errorlevel 1 goto failed
+exit /b 0
+
+:failed
+rem Started by a double click the window would close at once; keep it open so the reason can be read.
+echo.
+echo D455 Studio stopped with an error. The lines above say why.
+pause
+exit /b 1
